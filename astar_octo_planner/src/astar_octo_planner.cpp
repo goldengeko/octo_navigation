@@ -440,7 +440,7 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
 
   // Create a subscription to the point cloud topic.
   pointcloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/navigation/octomap_point_cloud_centers", 1,
+      "/octomap_point_cloud_centers", 1,
       std::bind(&AstarOctoPlanner::pointcloud2Callback, this, std::placeholders::_1));
 
   reconfiguration_callback_handle_ = node_->add_on_set_parameters_callback(
