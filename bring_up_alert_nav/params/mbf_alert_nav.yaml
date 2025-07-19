@@ -2,7 +2,7 @@ move_base_flex:
   ros__parameters:
     global_frame: 'map'
     robot_frame: 'base_link'
-    odom_topic: '/utlidar/robot_odom'
+    odom_topic: '/Go2/odometry'
 
     use_sim_time: false
     force_stop_at_goal: true
