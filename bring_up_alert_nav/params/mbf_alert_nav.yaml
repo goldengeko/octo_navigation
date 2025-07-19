@@ -4,7 +4,7 @@ move_base_flex:
     robot_frame: 'base_link'
     odom_topic: '/Go2/odometry'
 
-    use_sim_time: false
+    use_sim_time: true
     force_stop_at_goal: true
     force_stop_on_cancel: true
 

@@ -2,9 +2,11 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from visualization_msgs.msg import Marker, MarkerArray
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PointStamped, Pose, Twist
+from mbf_msgs.action import MoveBase
 import numpy as np
 import tf2_ros
 from alert_exploration.frontier_utils import *
@@ -12,7 +14,7 @@ from copy import deepcopy
 
 EXPANSION_SIZE = 2
 SPEED = 0.3
-LOOKAHEAD_DISTANCE = 0.4
+LOOKAHEAD_DISTANCE = 0.2
 TARGET_ERROR = 0.3
 TARGET_ALLOWED_TIME = 10
 MAP_TRIES = 20
@@ -93,6 +95,8 @@ class OpenCVFrontierDetector(Node):
         self.inflated_map_pub = self.create_publisher(OccupancyGrid, "/projected_map_1m_inflated", 1)
         self.path_publisher = self.create_publisher(Marker, 'path_marker', 1)
 
+        self.action_client = ActionClient(self, MoveBase, '/move_base_flex/move_base')
+
         # Initialize the transform buffer and listener
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -107,39 +111,78 @@ class OpenCVFrontierDetector(Node):
 
         #self.twist_publisher = self.create_publisher(Twist, '/cmd_vel', 1)
 
+    def send_goal(self, goal):
+        if not self.action_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("Action server not available!")
+            return False
+
+        goal_msg = MoveBase.Goal()
+        
+        # Set target pose
+        goal_msg.target_pose.header.frame_id = 'map'
+        goal_msg.target_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.target_pose.pose.position.x = float(goal[0])
+        goal_msg.target_pose.pose.position.y = float(goal[1])
+        goal_msg.target_pose.pose.position.z = 0.0
+        goal_msg.target_pose.pose.orientation.x = 0.0
+        goal_msg.target_pose.pose.orientation.y = 0.0
+        goal_msg.target_pose.pose.orientation.z = 0.0
+        goal_msg.target_pose.pose.orientation.w = 1.0
+        
+        # Set additional required fields
+        goal_msg.controller = ''
+        goal_msg.planner = ''
+        goal_msg.recovery_behaviors = []
+        
+        # Send the goal with result callback
+        send_goal_future = self.action_client.send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(self.goal_response_callback)
+        
+        self.get_logger().info(f"Sending goal to: ({goal[0]:.2f}, {goal[1]:.2f})")
+        return send_goal_future
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info('Goal rejected')
+            self.in_motion = False
+            return
+        
+        self.get_logger().info('Goal accepted')
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.goal_result_callback)
+
+    def goal_result_callback(self, future):
+        result = future.result().result
+        self.get_logger().info(f'Goal finished with result: {result}')
+        
+        # Reset motion flag and move to next frontier
+        self.in_motion = False
+        if hasattr(self, 'current_frontier_index'):
+            self.current_frontier_index += 1
+            self.get_logger().info(f"Moving to next frontier: {self.current_frontier_index}")
+
     def frontier_timer_callback(self):
         if not hasattr(self, 'inflated_map'):
             self.get_logger().warn("No map received yet")
             return
 
-        # if not hasattr(self, 'x'):
-        #     self.get_logger().warn("No robot position received yet")
-        #     return
+        if not hasattr(self, 'x') or not hasattr(self, 'y'):
+            self.get_logger().warn("No robot position received yet")
+            return
 
         # if self.in_motion:
         #     return
 
-        markers = MarkerArray()
-        markers.markers = []
-
         current_map = self.inflated_map
         current_map = add_free_space_at_robot(current_map, self.x, self.y, FREE_SPACE_RADIUS)
 
-        path_marker = Marker()
-        path_marker.header = current_map.header
-        path_marker.type = Marker.LINE_STRIP
-        path_marker.action = Marker.ADD
-        path_marker.scale.x = 0.1  # Line width
-        path_marker.color.a = 1.0  # Alpha
-        path_marker.color.r = 0.0  # Red
-        path_marker.color.g = 1.0  # Green
-        path_marker.color.b = 0.0  # Blue
-
         frontier_groups, matrix = getfrontier_groups(current_map)
-        frontiers = []
         if len(frontier_groups) == 0:
             self.get_logger().warn("No frontiers found")
             return
+
+        frontiers = []
         for i, group in enumerate(frontier_groups):
             y_coords, x_coords = zip(*group[1])
             centroid = calculate_centroid(x_coords, y_coords)
@@ -163,15 +206,40 @@ class OpenCVFrontierDetector(Node):
         # Keep only the top 5 frontiers
         frontiers = filtered_frontiers[:5]
 
-        #reachable_paths = []
-        for i, frontier in enumerate(frontiers):
-            adjusted_frontier, is_adjusted_frontier = get_nearest_free_space(current_map, frontier)
+        if not frontiers:
+            self.get_logger().warn("No suitable frontiers after filtering")
+            return
 
-            reshaped_map = np.array(current_map.data).reshape(current_map.info.height, current_map.info.width)
-            start_coords = world_to_map_coords(current_map, self.x, self.y)
-            target_coords = world_to_map_coords(current_map, adjusted_frontier[0], adjusted_frontier[1])
+        # Pick the closest frontier (or loop if you want all)
+        if not hasattr(self, 'frontier_queue') or not self.frontier_queue:
+            self.frontier_queue = frontiers.copy()
+            self.current_frontier_index = 0
 
-        self.get_logger().info("Start: " + str(start_coords) + " target_coords: " + str(target_coords))
+        if self.current_frontier_index >= len(self.frontier_queue):
+            self.get_logger().info("All frontiers explored or attempted.")
+            self.in_motion = False
+            return
+
+        frontier = self.frontier_queue[self.current_frontier_index]
+        adjusted_frontier, is_adjusted_frontier = get_nearest_free_space(current_map, frontier)
+        start_coords = world_to_map_coords(current_map, self.x, self.y)
+        target_coords = world_to_map_coords(current_map, adjusted_frontier[0], adjusted_frontier[1])
+        
+
+        # Check if robot is close enough to the current frontier
+        distance_to_frontier = np.linalg.norm([frontier[0] - self.x, frontier[1] - self.y])
+        if distance_to_frontier < TARGET_ERROR:
+            self.get_logger().info(f"Reached frontier {self.current_frontier_index + 1}/{len(self.frontier_queue)}")
+            self.current_frontier_index += 1
+            self.in_motion = False
+            return
+
+        if not self.in_motion:
+            # Send world coordinates (adjusted_frontier) instead of map coordinates (target_coords)
+            self.send_goal(adjusted_frontier)
+            self.get_logger().info(f"Start: {start_coords} target_coords (map): {target_coords}")
+            self.get_logger().info(f"Goal sent in world coords: ({adjusted_frontier[0]:.2f}, {adjusted_frontier[1]:.2f})")
+            self.in_motion = True
 
         #    path, is_frontier_reachable = astar(reshaped_map, start_coords, target_coords)
 
