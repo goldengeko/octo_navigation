@@ -31,3 +31,4 @@ move_base_flex:
     cmd_vel_ignored_tolerance: 15.0
 
     controller_frequency: 50.0
+

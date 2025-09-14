@@ -22,8 +22,10 @@ def generate_launch_description():
         remappings=[
             ("/move_base_flex/cmd_vel", "/cmd_vel"),
         ],
+        
         parameters=[
             mbf_octo_nav_config,
+            {"use_sim_time": True},
         ],
     )
 
