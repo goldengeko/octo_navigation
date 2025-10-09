@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'frontier_selector = alert_exploration.frontier_selector:main'
+            'frontier_selector = alert_exploration.frontier_selector:main',
+            'mbf_exploration_node = alert_exploration.mbf_exploration:main',
         ],
     },
 )
