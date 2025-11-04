@@ -31,7 +31,8 @@ def generate_launch_description():
         package="bring_up_alert_nav",
         executable="exe_path_node",
         name="exe_path",
-        output="screen")
+        # output="screen"
+        )
     
     # Node for octo_planner
     posture_mgr = Node(
@@ -47,7 +48,7 @@ def generate_launch_description():
     map_odom = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
-        output="screen",
+        # output="screen",
         arguments=["0", "0", "0", "0", "0", "0", "map", "odom"],
     )
 
