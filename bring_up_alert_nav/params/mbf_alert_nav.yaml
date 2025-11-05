@@ -1,7 +1,7 @@
 move_base_flex:
   ros__parameters:
     global_frame: 'map'
-    robot_frame: 'feet_center'
+    robot_frame: 'base_link'
     odom_topic: '/odometry'
 
     use_sim_time: false
@@ -11,6 +11,7 @@ move_base_flex:
     planners: ['octo_planner']
     octo_planner:
       type: 'astar_2d_planner/Astar2dPlanner'
+      #type: 'astar_octo_planner/AstarOctoPlanner'
       cost_limit: 0.8
       publish_vector_field: true
     planner_patience: 10.0

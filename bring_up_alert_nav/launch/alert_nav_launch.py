@@ -32,7 +32,13 @@ def generate_launch_description():
         executable="exe_path_node",
         name="exe_path",
         output="screen")
-    
+        
+    stamped_conversion = Node(
+        package="alert_utils",
+        executable="stamped_twist_converter",
+        name="exe_path",
+        output="screen")
+        
     # Node for octo_planner
     posture_mgr = Node(
         package="bring_up_alert_nav",
@@ -55,8 +61,9 @@ def generate_launch_description():
 
         [
             #map_odom,
+            stamped_conversion,
             move_base_flex,
             delayed_exe_path,
-            posture_mgr,
+            #posture_mgr,
         ]
     )

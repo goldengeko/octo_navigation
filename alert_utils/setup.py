@@ -1,8 +1,6 @@
 from setuptools import find_packages, setup
-import os
-from glob import glob
 
-package_name = 'bring_up_alert_nav'
+package_name = 'alert_utils'
 
 setup(
     name=package_name,
@@ -12,20 +10,17 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join("share", package_name, "launch"), glob("launch/*_launch.py")),
-        (os.path.join("share", package_name, "params"), glob("params/*.yaml")),
-
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='max1',
-    maintainer_email='skpawar1305@gmail.com',
+    maintainer_email='alert@fh-aachen.de',
     description='TODO: Package description',
     license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'twist_stamped_converter = bring_up_alert_nav.twist_stamped_converter:main',
+            'stamped_twist_converter = alert_utils.stamped_twist_converter:main'
         ],
     },
 )

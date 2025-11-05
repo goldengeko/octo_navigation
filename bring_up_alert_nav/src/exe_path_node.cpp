@@ -4,6 +4,7 @@
 #include "bring_up_alert_nav/srv/start_nav.hpp"
 #include <mbf_msgs/action/exe_path.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <mbf_msgs/action/move_base.hpp>
 #include <mbf_msgs/action/get_path.hpp>
@@ -30,9 +31,9 @@ public:
         "move_base_flex/get_path");
 
     // Subscriber
-    goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-        "/goal_pose",      // RViz 預設 topic
-        1,
+    goal_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+        "/initialpose",      // RViz 預設 topic
+        10,
         std::bind(&ExePath::goalPoseCallback, this, std::placeholders::_1));
 
     // ① Get topic of path（astar_2D_planner's publisher）
@@ -75,9 +76,9 @@ public:
   }
 
 private:
-  void goalPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+  void goalPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
-    if (auto_execute_goal_) 
+    if (auto_execute_goal_)
     {
       RCLCPP_INFO(get_logger(), "RViz goal received → send MoveBase");
 
@@ -88,8 +89,8 @@ private:
       }
 
       auto goal_msg = mbf_msgs::action::MoveBase::Goal();
-      goal_msg.target_pose = *msg;
-
+      goal_msg.target_pose.header = msg->header;
+      goal_msg.target_pose.pose = msg->pose.pose;
       auto opts = rclcpp_action::Client<mbf_msgs::action::MoveBase>::SendGoalOptions();
       opts.goal_response_callback =
           [this](auto handle){
@@ -128,7 +129,8 @@ private:
       }
 
       auto goal_msg = mbf_msgs::action::GetPath::Goal();
-      goal_msg.target_pose = *msg;
+      goal_msg.target_pose.header = msg->header;
+      goal_msg.target_pose.pose = msg->pose.pose;
 
       auto opts = rclcpp_action::Client<mbf_msgs::action::GetPath>::SendGoalOptions();
       opts.goal_response_callback =
@@ -211,7 +213,7 @@ private:
   nav_msgs::msg::Path latest_path__smooth_;
 
   // 2D Goal pose
-  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr goal_sub_;
   rclcpp_action::Client<mbf_msgs::action::MoveBase>::SharedPtr     mbf_movebase_ac_;
   rclcpp_action::Client<mbf_msgs::action::GetPath>::SharedPtr      mbf_getpath_ac_;
   // Exe path
