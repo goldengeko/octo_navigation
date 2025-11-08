@@ -72,7 +72,7 @@ uint32_t OctoController::computeVelocityCommands(const geometry_msgs::msg::PoseS
   // Extract current position from the pose.
   double current_x = pose.pose.position.x;
   double current_y = pose.pose.position.y;
-  
+
   // Compute the robot's yaw angle from the quaternion.
   double qx = pose.pose.orientation.x;
   double qy = pose.pose.orientation.y;
@@ -96,7 +96,6 @@ uint32_t OctoController::computeVelocityCommands(const geometry_msgs::msg::PoseS
   cmd_vel.twist.linear.x = linear_vel;
   cmd_vel.twist.angular.z = angular_vel;
   cmd_vel.header.stamp = node_->now();
-
   if (cancel_requested_) {
     return mbf_msgs::action::ExePath::Result::CANCELED;
   }
@@ -189,10 +188,10 @@ bool OctoController::isGoalReached(double dist_tolerance, double angle_tolerance
   double dy = goal_pos_.pose.position.y - current_pose_.pose.position.y;
   double dz = goal_pos_.pose.position.z - current_pose_.pose.position.z;
   double goal_distance = std::sqrt(dx * dx + dy * dy + dz * dz);
-
+  dist_tolerance = 0.57;
+  RCLCPP_INFO(node_->get_logger(), "Goal distance: %f,  dist_tolerance: %f", goal_distance, dist_tolerance);
   // Calculate the angle difference between the robot's current orientation and the goal orientation
   double angle = std::acos(std::cos(current_pose_.pose.orientation.z - goal_pos_.pose.orientation.z));
-  dist_tolerance = 0.3;
   return goal_distance <= dist_tolerance;
 }
 

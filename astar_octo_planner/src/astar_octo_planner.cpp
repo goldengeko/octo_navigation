@@ -109,6 +109,17 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
     return mbf_msgs::action::GetPath::Result::FAILURE;
   }
 
+  // Ensure we have a point cloud frame recorded and that start/goal frames match it.
+  if (map_frame_.empty()) {
+    RCLCPP_WARN(node_->get_logger(), "No point cloud received yet; cannot ensure planning frame alignment.");
+  } else {
+    if (start.header.frame_id != map_frame_ || goal.header.frame_id != map_frame_) {
+      RCLCPP_ERROR(node_->get_logger(), "Start/goal frames (%s / %s) do not match point cloud frame (%s). Please provide poses in the same frame as the point cloud.",
+                   start.header.frame_id.c_str(), goal.header.frame_id.c_str(), map_frame_.c_str());
+      return mbf_msgs::action::GetPath::Result::TF_ERROR;
+    }
+  }
+
   // Run A* search on the occupancy grid.
   auto grid_path = astar(
     std::make_tuple(start_grid_pt.x, start_grid_pt.y, start_grid_pt.z),
@@ -138,7 +149,8 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
   // Publish the path for visualization.
   nav_msgs::msg::Path path_msg;
   path_msg.header.stamp = node_->now();
-  path_msg.header.frame_id = "vision";
+  // Use the same frame as the start pose for the published path.
+  path_msg.header.frame_id = start.header.frame_id;
   path_msg.poses = plan;
   path_pub_->publish(path_msg);
 
@@ -365,6 +377,12 @@ void AstarOctoPlanner::pointcloud2Callback(const sensor_msgs::msg::PointCloud2::
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
   pcl::fromROSMsg(*msg, *cloud);
 
+  // Store the frame of the incoming cloud for later validation of start/goal frames.
+  if (map_frame_.empty()) {
+    map_frame_ = msg->header.frame_id;
+    RCLCPP_INFO(node_->get_logger(), "Received first point cloud in frame: %s", map_frame_.c_str());
+  }
+
   if (cloud->empty()) {
     RCLCPP_WARN(node_->get_logger(), "No points received in the point cloud.");
     return;
@@ -443,6 +461,15 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
       "/navigation/octomap_point_cloud_centers", 1,
       std::bind(&AstarOctoPlanner::pointcloud2Callback, this, std::placeholders::_1));
 
+  // Declare planner tuning parameters (can be changed at runtime)
+  z_threshold_ = node_->declare_parameter(name_ + ".z_threshold", z_threshold_);
+  robot_radius_ = node_->declare_parameter(name_ + ".robot_radius", robot_radius_);
+  min_vertical_clearance_ = node_->declare_parameter(name_ + ".min_vertical_clearance", min_vertical_clearance_);
+  max_vertical_clearance_ = node_->declare_parameter(name_ + ".max_vertical_clearance", max_vertical_clearance_);
+
+  RCLCPP_INFO(node_->get_logger(), "Declared parameters: %s.z_threshold=%.3f, %s.robot_radius=%.3f, %s.min_vertical_clearance=%.3f, %s.max_vertical_clearance=%.3f",
+               name_.c_str(), z_threshold_, name_.c_str(), robot_radius_, name_.c_str(), min_vertical_clearance_, name_.c_str(), max_vertical_clearance_);
+
   reconfiguration_callback_handle_ = node_->add_on_set_parameters_callback(
       std::bind(&AstarOctoPlanner::reconfigureCallback, this, std::placeholders::_1));
 
@@ -456,6 +483,18 @@ rcl_interfaces::msg::SetParametersResult AstarOctoPlanner::reconfigureCallback(s
     if (parameter.get_name() == name_ + ".cost_limit") {
       config_.cost_limit = parameter.as_double();
       RCLCPP_INFO_STREAM(node_->get_logger(), "New cost limit parameter received via dynamic reconfigure.");
+    } else if (parameter.get_name() == name_ + ".z_threshold") {
+      z_threshold_ = parameter.as_double();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated z_threshold to " << z_threshold_);
+    } else if (parameter.get_name() == name_ + ".robot_radius") {
+      robot_radius_ = parameter.as_double();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated robot_radius to " << robot_radius_);
+    } else if (parameter.get_name() == name_ + ".min_vertical_clearance") {
+      min_vertical_clearance_ = parameter.as_double();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated min_vertical_clearance to " << min_vertical_clearance_);
+    } else if (parameter.get_name() == name_ + ".max_vertical_clearance") {
+      max_vertical_clearance_ = parameter.as_double();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated max_vertical_clearance to " << max_vertical_clearance_);
     }
   }
   result.successful = true;
