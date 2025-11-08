@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'stamped_twist_converter = alert_utils.stamped_twist_converter:main'
+            'stamped_twist_converter = alert_utils.stamped_twist_converter:main',
+            'pcl_mapfilter = alert_utils.pcl_mapfilter:main',
         ],
     },
 )
