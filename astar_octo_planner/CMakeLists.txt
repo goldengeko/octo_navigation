@@ -9,6 +9,9 @@ find_package(rclcpp REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(octomap REQUIRED)
+find_package(octomap_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 pluginlib_export_plugin_description_file(mbf_octo_core astar_octo_planner.xml)
 
@@ -22,7 +25,8 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   ${pluginlib_INCLUDE_DIRS}
 )
 target_compile_definitions(${PROJECT_NAME} PRIVATE "ASTAR_OCTO_PLANNER_BUILDING_LIBRARY")
-ament_target_dependencies(${PROJECT_NAME} mbf_octo_core mbf_msgs mbf_utility rclcpp pluginlib sensor_msgs pcl_conversions)
+ament_target_dependencies(${PROJECT_NAME} mbf_octo_core mbf_msgs mbf_utility rclcpp pluginlib sensor_msgs pcl_conversions octomap octomap_msgs)
+ament_target_dependencies(${PROJECT_NAME} visualization_msgs)
 target_link_libraries(${PROJECT_NAME}
     ${MPI_CXX_LIBRARIES}
 )
@@ -40,5 +44,6 @@ install(TARGETS ${PROJECT_NAME}
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
 ament_export_targets(export_${PROJECT_NAME})
-ament_export_dependencies(mbf_octo_core mbf_msgs mbf_utility rclcpp pluginlib)
+ament_export_dependencies(mbf_octo_core mbf_msgs mbf_utility rclcpp pluginlib octomap octomap_msgs)
+ament_export_dependencies(visualization_msgs)
 ament_package()
