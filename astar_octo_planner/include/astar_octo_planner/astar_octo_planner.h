@@ -188,6 +188,12 @@ private:
   // (removed) hasNoOccupiedCellsAbove: legacy vertical-check helper not used in current planner
   bool isCylinderCollisionFree(const std::tuple<int, int, int>& coord, double radius);
 
+  // Temporarily clear occupied voxels within a vertical cylinder around a point
+  // center: world coordinates of cylinder center
+  // radius: horizontal radius (meters)
+  // z_bottom, z_top: vertical bounds (meters)
+  void clearOccupiedCylinderAround(const geometry_msgs::msg::Point &center, double radius, double z_bottom, double z_top);
+
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_sub_;
 
   // Octree pointer (owned when we deserialize from messages)
