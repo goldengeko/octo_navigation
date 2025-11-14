@@ -245,6 +245,10 @@ private:
   // Maximum bound for the occupancy grid.
   std::array<double, 3> max_bound_;
 
+  // Corner/edge penalty tuning
+  double corner_radius_ = 0.30;           // meters
+  double corner_penalty_weight_ = 1.0;    // multiplier for penalty
+
   // Hash function for tuple<int, int, int> to track unique occupied voxels
   struct TupleHash {
     template <typename T1, typename T2, typename T3>

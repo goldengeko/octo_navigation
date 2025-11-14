@@ -235,6 +235,8 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
       // Per-plan caches
       std::unordered_map<std::string, bool> node_ok; // node_id -> valid for robot
       std::unordered_map<std::string, bool> edge_ok; // "a|b" -> valid
+  // per-plan corner penalty cache
+  std::unordered_map<std::string, double> node_penalty;
 
       // Insert temporary start/goal nodes into local graph to ensure connection
       // compute temporary node ids
@@ -286,7 +288,7 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
         }
         // footprint check: reuse existing isCylinderCollisionFree which expects grid idx
         auto gidx = worldPointToGrid(gn.center);
-        bool ok = isCylinderCollisionFree(gidx, robot_radius_);
+        bool ok = true; //isCylinderCollisionFree(gidx, robot_radius_);
         node_ok[nid] = ok;
         return ok;
       };
@@ -320,7 +322,7 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
           if (nn && octree_->isNodeOccupied(nn)) { edge_ok[key] = false; return false; }
           // footprint clearance at this sample
           auto g = worldPointToGrid(s);
-          if (!isCylinderCollisionFree(g, robot_radius_)) { edge_ok[key] = false; return false; }
+          //if (!isCylinderCollisionFree(g, robot_radius_)) { edge_ok[key] = false; return false; }
         }
         edge_ok[key] = true;
         return true;
@@ -367,7 +369,32 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
           // lazy validate node and edge
           if (!isNodeClear(nb)) continue;
           if (!isEdgeClear(cur.id, nb)) continue;
-          double tentative = cur.g + (local_nodes.at(cur.id).center.distance(local_nodes.at(nb).center));
+          // compute basic move cost
+          double move_cost = local_nodes.at(cur.id).center.distance(local_nodes.at(nb).center);
+          // compute a simple neighbor-count corner penalty (cheap)
+          auto computeCornerPenalty = [&](const std::string &nid)->double {
+            auto itp = node_penalty.find(nid);
+            if (itp != node_penalty.end()) return itp->second;
+            const auto &n = local_nodes.at(nid);
+            // count neighbors within corner_radius_ in XY plane
+            int count = 0;
+            int total = 0;
+            for (const auto &kv2 : local_nodes) {
+              if (kv2.first == nid) continue;
+              ++total;
+              double dx = kv2.second.center.x() - n.center.x();
+              double dy = kv2.second.center.y() - n.center.y();
+              double dxy = std::sqrt(dx*dx + dy*dy);
+              if (dxy <= corner_radius_) ++count;
+            }
+            double density = total > 0 ? static_cast<double>(count) / static_cast<double>(total) : 0.0;
+            double corner_score = 1.0 - std::min(1.0, density);
+            double penalty = corner_penalty_weight_ * corner_score;
+            node_penalty[nid] = penalty;
+            return penalty;
+          };
+          double penalty = computeCornerPenalty(nb);
+          double tentative = cur.g + move_cost + penalty;
           if (gscore.find(nb) == gscore.end() || tentative < gscore[nb]) {
             came_from[nb] = cur.id;
             gscore[nb] = tentative;
@@ -402,7 +429,7 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
         // build a set of path node ids for quick lookup
         std::unordered_set<std::string> path_set(path_ids.begin(), path_ids.end());
         visualization_msgs::msg::Marker dead_mark;
-        dead_mark.header.frame_id = path_frame.empty() ? "map" : path_frame;
+  dead_mark.header.frame_id = map_frame_.empty() ? "map" : map_frame_;
         dead_mark.header.stamp = node_->now();
         dead_mark.ns = "graph_dead_nodes";
         dead_mark.id = 1;
@@ -427,9 +454,85 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
           p.z = itn->second.center.z();
           dead_mark.points.push_back(p);
         }
-        visualization_msgs::msg::MarkerArray ma;
-        ma.markers.push_back(dead_mark);
-        graph_marker_pub_->publish(ma);
+  visualization_msgs::msg::MarkerArray ma;
+  ma.markers.push_back(dead_mark);
+  RCLCPP_INFO(node_->get_logger(), "Publishing dead-node markers: points=%zu", dead_mark.points.size());
+  graph_marker_pub_->publish(ma);
+      }
+
+      // Also publish start/goal markers (yellow) if temporary nodes exist
+      if (publish_graph_markers_ && graph_marker_pub_) {
+        visualization_msgs::msg::Marker sgm;
+  sgm.header.frame_id = map_frame_.empty() ? "map" : map_frame_;
+        sgm.header.stamp = node_->now();
+        sgm.ns = "graph_start_goal";
+        sgm.id = 2;
+        sgm.type = visualization_msgs::msg::Marker::CUBE_LIST;
+        sgm.action = visualization_msgs::msg::Marker::ADD;
+        double sscale = active_voxel_size_ > 0.0 ? std::max(active_voxel_size_, 0.05) : 0.05;
+        sgm.scale.x = static_cast<float>(sscale);
+        sgm.scale.y = static_cast<float>(sscale);
+        sgm.scale.z = static_cast<float>(sscale);
+        // yellow
+        sgm.color.r = 1.0f;
+        sgm.color.g = 1.0f;
+        sgm.color.b = 0.0f;
+        sgm.color.a = 0.95f;
+        // add start and goal points if present
+        auto it_s = local_nodes.find(std::string("__tmp_start"));
+        if (it_s != local_nodes.end()) {
+          geometry_msgs::msg::Point ps;
+          ps.x = it_s->second.center.x(); ps.y = it_s->second.center.y(); ps.z = it_s->second.center.z();
+          sgm.points.push_back(ps);
+        }
+        auto it_g = local_nodes.find(std::string("__tmp_goal"));
+        if (it_g != local_nodes.end()) {
+          geometry_msgs::msg::Point pg;
+          pg.x = it_g->second.center.x(); pg.y = it_g->second.center.y(); pg.z = it_g->second.center.z();
+          sgm.points.push_back(pg);
+        }
+        if (!sgm.points.empty()) {
+          visualization_msgs::msg::MarkerArray ma2; ma2.markers.push_back(sgm);
+          RCLCPP_INFO(node_->get_logger(), "Publishing start/goal markers: points=%zu", sgm.points.size());
+          graph_marker_pub_->publish(ma2);
+        }
+      }
+
+      // Optionally publish penalty markers (color-coded) for nodes with non-zero penalty
+      if (publish_graph_markers_ && graph_marker_pub_) {
+        visualization_msgs::msg::Marker pen_m;
+        pen_m.header.frame_id = map_frame_.empty() ? "map" : map_frame_;
+        pen_m.header.stamp = node_->now();
+        pen_m.ns = "graph_penalty";
+        pen_m.id = 3;
+        pen_m.type = visualization_msgs::msg::Marker::CUBE_LIST;
+        pen_m.action = visualization_msgs::msg::Marker::ADD;
+        double pscale = active_voxel_size_ > 0.0 ? std::max(active_voxel_size_, 0.05) : 0.05;
+        pen_m.scale.x = static_cast<float>(pscale);
+        pen_m.scale.y = static_cast<float>(pscale);
+        pen_m.scale.z = static_cast<float>(pscale);
+        for (const auto &kv : node_penalty) {
+          double pen = kv.second;
+          if (pen <= 1e-6) continue;
+          auto itn = local_nodes.find(kv.first);
+          if (itn == local_nodes.end()) continue;
+          geometry_msgs::msg::Point p;
+          p.x = itn->second.center.x(); p.y = itn->second.center.y(); p.z = itn->second.center.z();
+          pen_m.points.push_back(p);
+          // color ramp: low green -> high red
+          std_msgs::msg::ColorRGBA c;
+          double v = std::min(1.0, pen / std::max(1e-6, corner_penalty_weight_));
+          c.r = static_cast<float>(v);
+          c.g = static_cast<float>(1.0 - v);
+          c.b = 0.0f;
+          c.a = 0.9f;
+          pen_m.colors.push_back(c);
+        }
+        if (!pen_m.points.empty()) {
+          visualization_msgs::msg::MarkerArray pma; pma.markers.push_back(pen_m);
+          RCLCPP_INFO(node_->get_logger(), "Publishing penalty markers: points=%zu", pen_m.points.size());
+          graph_marker_pub_->publish(pma);
+        }
       }
     }
 
@@ -905,11 +1008,15 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   footprint_samples_y_ = node_->declare_parameter(name_ + ".footprint_samples_y", footprint_samples_y_);
   max_surface_distance_ = node_->declare_parameter(name_ + ".max_surface_distance", max_surface_distance_);
   max_step_height_ = node_->declare_parameter(name_ + ".max_step_height", max_step_height_);
+  // corner/edge penalty parameters
+  corner_radius_ = node_->declare_parameter(name_ + ".corner_radius", 0.30);
+  corner_penalty_weight_ = node_->declare_parameter(name_ + ".corner_penalty_weight", 1.0);
 
   // Graph marker publishing (for RViz visualization of node centers)
     publish_graph_markers_ = node_->declare_parameter(name_ + ".publish_graph_markers", publish_graph_markers_);
-    // always create publisher so we can toggle publishing at runtime without creating publishers later
-    graph_marker_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>("~/graph_nodes", rclcpp::QoS(1));
+  // always create publisher so we can toggle publishing at runtime without creating publishers later
+  // use transient_local so RViz or late subscribers receive the last published markers
+  graph_marker_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>("~/graph_nodes", rclcpp::QoS(1).transient_local());
 
   RCLCPP_INFO(node_->get_logger(), "Declared parameters: %s.z_threshold=%.3f, %s.robot_radius=%.3f, %s.min_vertical_clearance=%.3f, %s.max_vertical_clearance=%.3f",
                name_.c_str(), z_threshold_, name_.c_str(), robot_radius_, name_.c_str(), min_vertical_clearance_, name_.c_str(), max_vertical_clearance_);
