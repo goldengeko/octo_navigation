@@ -47,6 +47,8 @@
 
 #include <queue>
 #include <algorithm>
+#include <random>
+#include <cmath>
 
 PLUGINLIB_EXPORT_CLASS(astar_octo_planner::AstarOctoPlanner, mbf_octo_core::OctoPlanner);
 
@@ -237,6 +239,8 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
       std::unordered_map<std::string, bool> edge_ok; // "a|b" -> valid
   // per-plan corner penalty cache
   std::unordered_map<std::string, double> node_penalty;
+  // record nodes that received a non-zero penalty during neighbor evaluation
+  std::unordered_set<std::string> penalized_nodes;
 
       // Insert temporary start/goal nodes into local graph to ensure connection
       // compute temporary node ids
@@ -371,26 +375,195 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
           if (!isEdgeClear(cur.id, nb)) continue;
           // compute basic move cost
           double move_cost = local_nodes.at(cur.id).center.distance(local_nodes.at(nb).center);
-          // compute a simple neighbor-count corner penalty (cheap)
+          // compute a sector-histogram based wall/corner penalty (2D) with RANSAC fallback
           auto computeCornerPenalty = [&](const std::string &nid)->double {
             auto itp = node_penalty.find(nid);
             if (itp != node_penalty.end()) return itp->second;
             const auto &n = local_nodes.at(nid);
-            // count neighbors within corner_radius_ in XY plane
-            int count = 0;
-            int total = 0;
+            // collect neighbors for sector histogram (sector_radius_) and for RANSAC (ransac_radius_)
+            std::vector<std::pair<double,double>> pts_ransac;
+            std::vector<std::pair<double,double>> pts_sector;
             for (const auto &kv2 : local_nodes) {
               if (kv2.first == nid) continue;
-              ++total;
               double dx = kv2.second.center.x() - n.center.x();
               double dy = kv2.second.center.y() - n.center.y();
               double dxy = std::sqrt(dx*dx + dy*dy);
-              if (dxy <= corner_radius_) ++count;
+              if (dxy <= ransac_radius_) pts_ransac.emplace_back(dx, dy);
+              if (dxy <= sector_radius_) pts_sector.emplace_back(dx, dy);
             }
-            double density = total > 0 ? static_cast<double>(count) / static_cast<double>(total) : 0.0;
-            double corner_score = 1.0 - std::min(1.0, density);
-            double penalty = corner_penalty_weight_ * corner_score;
+            double penalty = 0.0;
+
+            // Centroid-shift (mean-shift inspired) edge detector
+            // For the tested node, compute centroid of up to centroid_k_ nearest neighbors
+            if (pts_ransac.size() >= 4) {
+              // build a vector of neighbor full positions using local_nodes
+              std::vector<octomap::point3d> nbrs;
+              nbrs.reserve(pts_ransac.size());
+              for (const auto &kv2 : local_nodes) {
+                if (kv2.first == nid) continue;
+                double dx = kv2.second.center.x() - n.center.x();
+                double dy = kv2.second.center.y() - n.center.y();
+                double dxy = std::sqrt(dx*dx + dy*dy);
+                if (dxy <= ransac_radius_) nbrs.push_back(kv2.second.center);
+              }
+              // sort by XY distance and keep top-k
+              std::sort(nbrs.begin(), nbrs.end(), [&](const octomap::point3d &a, const octomap::point3d &b){
+                double da = std::hypot(a.x()-n.center.x(), a.y()-n.center.y());
+                double db = std::hypot(b.x()-n.center.x(), b.y()-n.center.y());
+                return da < db;
+              });
+              if (!nbrs.empty()) {
+                size_t k_use = std::min(static_cast<size_t>(centroid_k_), nbrs.size());
+                // compute centroid C over k_use nearest
+                double cx=0, cy=0, cz=0;
+                for (size_t ii=0; ii<k_use; ++ii) { cx += nbrs[ii].x(); cy += nbrs[ii].y(); cz += nbrs[ii].z(); }
+                cx /= static_cast<double>(k_use); cy /= static_cast<double>(k_use); cz /= static_cast<double>(k_use);
+                double shift = std::sqrt((cx - n.center.x())*(cx - n.center.x()) + (cy - n.center.y())*(cy - n.center.y()) + (cz - n.center.z())*(cz - n.center.z()));
+                // compute local resolution Z_i as min distance from node to these k neighbors
+                double Zi = 1e9; for (size_t ii=0; ii<k_use; ++ii) {
+                  double dd = std::sqrt((nbrs[ii].x()-n.center.x())*(nbrs[ii].x()-n.center.x()) + (nbrs[ii].y()-n.center.y())*(nbrs[ii].y()-n.center.y()) + (nbrs[ii].z()-n.center.z())*(nbrs[ii].z()-n.center.z()));
+                  Zi = std::min(Zi, dd);
+                }
+                if (Zi < 1e-6) Zi = active_voxel_size_;
+                if (shift > centroid_lambda_ * Zi) {
+                  // classified as edge point; add centroid penalty
+                  penalty += centroid_penalty_weight_;
+                  penalized_nodes.insert(nid);
+                } else {
+                  // corner indicator: check spread in x,y,z among k neighbors
+                  double minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,minz=1e9,maxz=-1e9;
+                  for (size_t ii=0; ii<k_use; ++ii) {
+                    double vx = nbrs[ii].x(); double vy = nbrs[ii].y(); double vz = nbrs[ii].z();
+                    if (vx < minx) minx = vx; if (vx > maxx) maxx = vx;
+                    if (vy < miny) miny = vy; if (vy > maxy) maxy = vy;
+                    if (vz < minz) minz = vz; if (vz > maxz) maxz = vz;
+                  }
+                  int axes = 0; double rho = 0.05; // slack threshold
+                  if ((maxx - minx) > rho) ++axes; if ((maxy - miny) > rho) ++axes; if ((maxz - minz) > rho) ++axes;
+                  if (axes >= 2) { penalty += 0.5 * centroid_penalty_weight_; penalized_nodes.insert(nid); }
+                }
+              }
+            }
+
+            // Sector histogram detector (fast, deterministic)
+            if (pts_sector.size() >= static_cast<size_t>(sector_min_inliers_)) {
+              std::vector<int> hist(sector_bins_, 0);
+              for (const auto &pp : pts_sector) {
+                double ang = std::atan2(pp.second, pp.first);
+                if (ang < 0) ang += 2.0 * M_PI;
+                int bin = static_cast<int>(std::floor((ang / (2.0 * M_PI)) * sector_bins_)) % sector_bins_;
+                if (bin < 0) bin += sector_bins_;
+                hist[bin]++;
+              }
+              // find top two peaks
+              int max_idx = 0, second_idx = -1;
+              int max_val = hist[0];
+              for (int i = 1; i < sector_bins_; ++i) {
+                if (hist[i] > max_val) { second_idx = max_idx; max_idx = i; max_val = hist[i]; }
+                else if (second_idx < 0 || hist[i] > hist[second_idx]) { second_idx = i; }
+              }
+              double frac = static_cast<double>(max_val) / static_cast<double>(pts_sector.size());
+              if (frac >= sector_peak_thresh_) {
+                // strong wall in direction of max_idx -> moderate wall penalty
+                // compute average distance of points in the dominant bin
+                double mean_dist = 0.0; int cnt = 0;
+                double ang_low = (static_cast<double>(max_idx) / sector_bins_) * 2.0 * M_PI;
+                double ang_high = (static_cast<double>(max_idx + 1) / sector_bins_) * 2.0 * M_PI;
+                for (const auto &pp : pts_sector) {
+                  double ang = std::atan2(pp.second, pp.first);
+                  if (ang < 0) ang += 2.0 * M_PI;
+                  // check bin membership (wrap-aware)
+                  double a = ang;
+                  if (a >= ang_low && a < ang_high) { mean_dist += std::sqrt(pp.first*pp.first + pp.second*pp.second); ++cnt; }
+                }
+                if (cnt > 0) mean_dist /= static_cast<double>(cnt);
+                else mean_dist = sector_radius_;
+                double wall_pen = wall_penalty_weight_ * std::exp(-mean_dist / (0.5 * sector_radius_));
+                penalty += wall_pen;
+
+                // check for a second significant peak to indicate a corner (angularly separated)
+                if (second_idx >= 0 && hist[second_idx] > 0) {
+                  double frac2 = static_cast<double>(hist[second_idx]) / static_cast<double>(pts_sector.size());
+                  // compute angular separation
+                  int diff = std::abs(max_idx - second_idx);
+                  if (diff > sector_bins_/4 && (frac2 >= (sector_peak_thresh_ * 0.6))) {
+                    // treat as corner -> add corner penalty
+                    penalty += corner_penalty_weight_;
+                  }
+                }
+              }
+            }
+
+
+
+            // Fallback: if sector detector didn't provide enough evidence, use RANSAC (existing logic)
+            if (penalty <= 1e-9 && pts_ransac.size() >= static_cast<size_t>(ransac_min_inliers_)) {
+              std::mt19937 rng(123456);
+              size_t best_inliers = 0;
+              double best_m=0, best_c=0;
+              for (int iters=0; iters < ransac_iterations_; ++iters) {
+                std::uniform_int_distribution<size_t> dist(0, pts_ransac.size()-1);
+                size_t i1 = dist(rng); size_t i2 = dist(rng);
+                if (i1 == i2) continue;
+                auto p1 = pts_ransac[i1]; auto p2 = pts_ransac[i2];
+                double dx = p2.first - p1.first; double dy = p2.second - p1.second;
+                if (std::fabs(dx) < 1e-6 && std::fabs(dy) < 1e-6) continue;
+                double m = 0.0, c = 0.0;
+                bool vertical = std::fabs(dx) < 1e-6 && std::fabs(dy) > 1e-6;
+                if (!vertical) { m = dy / dx; c = p1.second - m * p1.first; }
+                size_t inliers = 0;
+                for (const auto &pp : pts_ransac) {
+                  double x = pp.first, y = pp.second;
+                  double dist_to_line = 0.0;
+                  if (!vertical) {
+                    double y_est = m * x + c; dist_to_line = std::fabs(y - y_est);
+                  } else { double x0 = p1.first; dist_to_line = std::fabs(x - x0); }
+                  if (dist_to_line <= ransac_dist_thresh_) ++inliers;
+                }
+                if (inliers > best_inliers) { best_inliers = inliers; best_m = m; best_c = c; }
+              }
+              if (best_inliers >= static_cast<size_t>(ransac_min_inliers_)) {
+                double dist_center = 1e9;
+                if (std::fabs(best_m) < 1e9) {
+                  double x0 = 0.0, y0 = 0.0; double y_est = best_m * x0 + best_c; dist_center = std::fabs(y0 - y_est);
+                }
+                double wall_pen = wall_penalty_weight_ * std::exp(-dist_center / (0.5 * ransac_radius_));
+                penalty += wall_pen;
+                // residual-based corner detection (second line)
+                std::vector<std::pair<double,double>> residuals;
+                for (const auto &pp : pts_ransac) {
+                  double x = pp.first, y = pp.second;
+                  double y_est = best_m * x + best_c; double d = std::fabs(y - y_est);
+                  if (d > ransac_dist_thresh_) residuals.push_back(pp);
+                }
+                if (residuals.size() >= static_cast<size_t>(ransac_min_inliers_)) {
+                  size_t best2_in = 0; double best2_m=0, best2_c=0;
+                  std::mt19937 rng2(654321);
+                  for (int it2=0; it2 < ransac_iterations_; ++it2) {
+                    std::uniform_int_distribution<size_t> dist2(0, residuals.size()-1);
+                    size_t j1 = dist2(rng2); size_t j2 = dist2(rng2);
+                    if (j1==j2) continue;
+                    auto q1 = residuals[j1]; auto q2 = residuals[j2];
+                    double dx = q2.first - q1.first; double dy = q2.second - q1.second;
+                    if (std::fabs(dx) < 1e-6 && std::fabs(dy) < 1e-6) continue;
+                    double m2 = dy / dx; double c2 = q1.second - m2 * q1.first;
+                    size_t in2 = 0;
+                    for (const auto &qq : residuals) { double y2 = m2 * qq.first + c2; if (std::fabs(qq.second - y2) <= ransac_dist_thresh_) ++in2; }
+                    if (in2 > best2_in) { best2_in = in2; best2_m = m2; best2_c = c2; }
+                  }
+                  if (best2_in >= static_cast<size_t>(ransac_min_inliers_)) {
+                    double ang1 = std::atan(best_m); double ang2 = std::atan(best2_m);
+                    double angdiff = std::fabs(ang1 - ang2) * 180.0 / M_PI;
+                    while (angdiff > 180.0) angdiff -= 360.0;
+                    if (angdiff < 0) angdiff = -angdiff;
+                    if (angdiff > corner_angle_thresh_deg_ && angdiff < (180.0 - corner_angle_thresh_deg_)) penalty += corner_penalty_weight_;
+                  }
+                }
+              }
+            }
+
             node_penalty[nid] = penalty;
+            if (penalty > 1e-6) penalized_nodes.insert(nid);
             return penalty;
           };
           double penalty = computeCornerPenalty(nb);
@@ -446,6 +619,8 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
         dead_mark.color.a = 0.85f;
         for (const auto &nid : expanded_set) {
           if (path_set.find(nid) != path_set.end()) continue;
+          // only include expanded nodes that were penalized (i.e. corner/edge)
+          if (penalized_nodes.find(nid) == penalized_nodes.end()) continue;
           auto itn = local_nodes.find(nid);
           if (itn == local_nodes.end()) continue;
           geometry_msgs::msg::Point p;
@@ -991,7 +1166,7 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   path_pub_ = node_->create_publisher<nav_msgs::msg::Path>("~/path", rclcpp::QoS(1).transient_local());
   // Subscribe to octomap binary topic (primary map source)
   octomap_sub_ = node_->create_subscription<octomap_msgs::msg::Octomap>(
-    "/navigation/octomap_binary", 1,
+    "/navigation/octomap_full", 1,
     std::bind(&AstarOctoPlanner::octomapCallback, this, std::placeholders::_1));
 
   // Declare planner tuning parameters (can be changed at runtime)
@@ -1009,8 +1184,17 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   max_surface_distance_ = node_->declare_parameter(name_ + ".max_surface_distance", max_surface_distance_);
   max_step_height_ = node_->declare_parameter(name_ + ".max_step_height", max_step_height_);
   // corner/edge penalty parameters
-  corner_radius_ = node_->declare_parameter(name_ + ".corner_radius", 0.30);
-  corner_penalty_weight_ = node_->declare_parameter(name_ + ".corner_penalty_weight", 1.0);
+  corner_radius_ = node_->declare_parameter(name_ + ".corner_radius", 0.40);
+  corner_penalty_weight_ = node_->declare_parameter(name_ + ".corner_penalty_weight", 3.0);
+  // Sector-histogram detector parameters (for directional wall/corner detection)
+  sector_bins_ = node_->declare_parameter(name_ + ".sector_bins", sector_bins_);
+  sector_radius_ = node_->declare_parameter(name_ + ".sector_radius", sector_radius_);
+  sector_peak_thresh_ = node_->declare_parameter(name_ + ".sector_peak_thresh", sector_peak_thresh_);
+  sector_min_inliers_ = node_->declare_parameter(name_ + ".sector_min_inliers", sector_min_inliers_);
+  centroid_k_ = node_->declare_parameter(name_ + ".centroid_k", centroid_k_);
+  centroid_lambda_ = node_->declare_parameter(name_ + ".centroid_lambda", centroid_lambda_);
+  centroid_penalty_weight_ = node_->declare_parameter(name_ + ".centroid_penalty_weight", centroid_penalty_weight_);
+
 
   // Graph marker publishing (for RViz visualization of node centers)
     publish_graph_markers_ = node_->declare_parameter(name_ + ".publish_graph_markers", publish_graph_markers_);

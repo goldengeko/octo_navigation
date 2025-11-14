@@ -206,6 +206,8 @@ private:
   double octomap_clamp_min_ = 0.1;
   double octomap_clamp_max_ = 0.95;
 
+
+
   // Callback for octomap subscription
   void octomapCallback(const octomap_msgs::msg::Octomap::SharedPtr msg);
 
@@ -245,9 +247,26 @@ private:
   // Maximum bound for the occupancy grid.
   std::array<double, 3> max_bound_;
 
-  // Corner/edge penalty tuning
-  double corner_radius_ = 0.30;           // meters
-  double corner_penalty_weight_ = 1.0;    // multiplier for penalty
+  // Corner/edge penalty tuning (defaults increased to keep robot away from walls)
+  double corner_radius_ = 0.20;           // meters
+  double corner_penalty_weight_ = 3.0;    // multiplier for penalty
+  // RANSAC-based wall/corner detection
+  double ransac_radius_ = 2.0;           // meters, neighborhood search radius
+  double ransac_dist_thresh_ = 0.1;      // meters, inlier distance threshold
+  int ransac_min_inliers_ = 16;            // minimum inliers to accept a line
+  int ransac_iterations_ = 30;            // RANSAC iterations
+  double wall_penalty_weight_ = 2.0;      // weight applied for wall-border nodes
+  double corner_angle_thresh_deg_ = 45.0; // degrees threshold to consider two lines a corner
+  // Sector-histogram detector params
+  int sector_bins_ = 8;                  // number of angular sectors
+  double sector_radius_ = 0.40;           // neighbor radius for sectors (m)
+  double sector_peak_thresh_ = 0.55;      // fraction of neighbors in peak bin to consider wall
+  int sector_min_inliers_ = 4;            // minimum neighbors to run sector logic
+
+  // Centroid-shift (mean-shift inspired) edge detector parameters
+  int centroid_k_ = 12;                 // k-nearest neighbors to use for centroid shift
+  double centroid_lambda_ = 1.0;        // lambda multiplier for local resolution threshold
+  double centroid_penalty_weight_ = 2.0;// penalty weight applied when centroid shift indicates edge
 
   // Hash function for tuple<int, int, int> to track unique occupied voxels
   struct TupleHash {
