@@ -301,6 +301,9 @@ private:
   // Marker publisher for graph visualization
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr graph_marker_pub_;
   bool publish_graph_markers_ = true;
+  // When false, incoming octomap messages are ignored and the background
+  // graph rebuild timer will not rebuild the graph. Subscription stays active.
+  bool enable_octomap_updates_ = true;
 
   // Build a sampling-based connectivity graph over interior empty nodes.
   // eps: small epsilon distance (meters) to sample just outside node boundaries.

@@ -1169,6 +1169,10 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
     "/navigation/octomap_full", 1,
     std::bind(&AstarOctoPlanner::octomapCallback, this, std::placeholders::_1));
 
+  // parameter: enable/disable processing of incoming octomap updates while
+  // keeping the subscription alive (useful to lock the map after mapping pass)
+  enable_octomap_updates_ = node_->declare_parameter(name_ + ".enable_octomap_updates", enable_octomap_updates_);
+
   // Declare planner tuning parameters (can be changed at runtime)
   z_threshold_ = node_->declare_parameter(name_ + ".z_threshold", z_threshold_);
   robot_radius_ = node_->declare_parameter(name_ + ".robot_radius", robot_radius_);
@@ -1212,6 +1216,7 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   graph_build_timer_ = node_->create_wall_timer(
     std::chrono::seconds(1),
     [this]() {
+      if (!enable_octomap_updates_) return; // do nothing when updates disabled
       if (!graph_dirty_) return;
       std::lock_guard<std::mutex> lock(graph_mutex_);
       if (!graph_dirty_) return;
@@ -1253,6 +1258,13 @@ void AstarOctoPlanner::octomapCallback(const octomap_msgs::msg::Octomap::SharedP
   octomap::AbstractOcTree* tree_ptr = octomap_msgs::fullMsgToMap(*msg);
   if (!tree_ptr) {
     RCLCPP_ERROR(node_->get_logger(), "Failed to convert Octomap message to AbstractOcTree");
+    return;
+  }
+
+  // Respect runtime toggle: if updates are disabled, drop incoming maps
+  if (!enable_octomap_updates_) {
+    //RCLCPP_INFO(node_->get_logger(), "enable_octomap_updates is false — ignoring incoming octomap message.");
+    delete tree_ptr;
     return;
   }
 
@@ -1387,6 +1399,16 @@ rcl_interfaces::msg::SetParametersResult AstarOctoPlanner::reconfigureCallback(s
     } else if (parameter.get_name() == name_ + ".max_vertical_clearance") {
       max_vertical_clearance_ = parameter.as_double();
       RCLCPP_INFO_STREAM(node_->get_logger(), "Updated max_vertical_clearance to " << max_vertical_clearance_);
+    } else if (parameter.get_name() == name_ + ".enable_octomap_updates") {
+      bool newval = parameter.as_bool();
+      if (newval != enable_octomap_updates_) {
+        enable_octomap_updates_ = newval;
+        RCLCPP_INFO_STREAM(node_->get_logger(), "Updated enable_octomap_updates to " << enable_octomap_updates_);
+        if (!enable_octomap_updates_) {
+          // stop auto-rebuilding; keep existing graph
+          graph_dirty_ = false;
+        }
+      }
     }
   }
   result.successful = true;
