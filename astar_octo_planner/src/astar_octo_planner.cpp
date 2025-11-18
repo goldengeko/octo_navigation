@@ -564,38 +564,6 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
 
             node_penalty[nid] = penalty;
             if (penalty > 1e-6) penalized_nodes.insert(nid);
-            // Conservative spherical (3D) penalty spread: distribute a fraction of
-            // this node's penalty to nearby nodes within penalty_spread_radius_.
-            if (penalty > 1e-6 && penalty_spread_factor_ > 1e-9 && penalty_spread_radius_ > 1e-6) {
-              struct Neighbor { std::string id; double d; double w; };
-              std::vector<Neighbor> nbrs;
-              double total_w = 0.0;
-              for (const auto &kv3 : local_nodes) {
-                const std::string &oid = kv3.first;
-                if (oid == nid) continue;
-                double dx = kv3.second.center.x() - n.center.x();
-                double dy = kv3.second.center.y() - n.center.y();
-                double dz = kv3.second.center.z() - n.center.z();
-                double d = std::sqrt(dx*dx + dy*dy + dz*dz);
-                if (d <= penalty_spread_radius_) {
-                  double w = std::exp(-d / std::max(penalty_spread_radius_, 1e-6));
-                  nbrs.push_back({oid, d, w});
-                  total_w += w;
-                }
-              }
-              if (!nbrs.empty() && total_w > 0.0) {
-                // cap factor to [0,1]
-                double factor = std::max(0.0, std::min(1.0, penalty_spread_factor_));
-                double total_spread = penalty * factor;
-                for (const auto &nnn : nbrs) {
-                  double add = total_spread * (nnn.w / total_w);
-                  if (add > 1e-6) {
-                    node_penalty[nnn.id] += add;
-                    penalized_nodes.insert(nnn.id);
-                  }
-                }
-              }
-            }
             return penalty;
           };
           double penalty = computeCornerPenalty(nb);
@@ -1201,9 +1169,6 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
     "/navigation/octomap_full", 1,
     std::bind(&AstarOctoPlanner::octomapCallback, this, std::placeholders::_1));
 
-  // Whether incoming octomap messages should update the planner/graph.
-  enable_octomap_updates_ = node_->declare_parameter(name_ + ".enable_octomap_updates", enable_octomap_updates_);
-
   // Declare planner tuning parameters (can be changed at runtime)
   z_threshold_ = node_->declare_parameter(name_ + ".z_threshold", z_threshold_);
   robot_radius_ = node_->declare_parameter(name_ + ".robot_radius", robot_radius_);
@@ -1230,10 +1195,6 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   centroid_lambda_ = node_->declare_parameter(name_ + ".centroid_lambda", centroid_lambda_);
   centroid_penalty_weight_ = node_->declare_parameter(name_ + ".centroid_penalty_weight", centroid_penalty_weight_);
 
-  // spherical penalty spread params
-  penalty_spread_radius_ = node_->declare_parameter(name_ + ".penalty_spread_radius", penalty_spread_radius_);
-  penalty_spread_factor_ = node_->declare_parameter(name_ + ".penalty_spread_factor", penalty_spread_factor_);
-
 
   // Graph marker publishing (for RViz visualization of node centers)
     publish_graph_markers_ = node_->declare_parameter(name_ + ".publish_graph_markers", publish_graph_markers_);
@@ -1251,7 +1212,6 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   graph_build_timer_ = node_->create_wall_timer(
     std::chrono::seconds(1),
     [this]() {
-      if (!enable_octomap_updates_) return; // updates disabled at runtime
       if (!graph_dirty_) return;
       std::lock_guard<std::mutex> lock(graph_mutex_);
       if (!graph_dirty_) return;
@@ -1293,13 +1253,6 @@ void AstarOctoPlanner::octomapCallback(const octomap_msgs::msg::Octomap::SharedP
   octomap::AbstractOcTree* tree_ptr = octomap_msgs::fullMsgToMap(*msg);
   if (!tree_ptr) {
     RCLCPP_ERROR(node_->get_logger(), "Failed to convert Octomap message to AbstractOcTree");
-    return;
-  }
-
-  // If updates are disabled at runtime, drop the incoming map and do nothing.
-  if (!enable_octomap_updates_) {
-    // RCLCPP_INFO(node_->get_logger(), "Octomap updates are currently disabled; ignoring incoming map.");
-    delete tree_ptr;
     return;
   }
 
@@ -1434,20 +1387,6 @@ rcl_interfaces::msg::SetParametersResult AstarOctoPlanner::reconfigureCallback(s
     } else if (parameter.get_name() == name_ + ".max_vertical_clearance") {
       max_vertical_clearance_ = parameter.as_double();
       RCLCPP_INFO_STREAM(node_->get_logger(), "Updated max_vertical_clearance to " << max_vertical_clearance_);
-    } else if (parameter.get_name() == name_ + ".penalty_spread_radius") {
-      penalty_spread_radius_ = parameter.as_double();
-      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated penalty_spread_radius to " << penalty_spread_radius_);
-    } else if (parameter.get_name() == name_ + ".penalty_spread_factor") {
-      penalty_spread_factor_ = parameter.as_double();
-      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated penalty_spread_factor to " << penalty_spread_factor_);
-    } else if (parameter.get_name() == name_ + ".enable_octomap_updates") {
-      bool newval = parameter.as_bool();
-      if (newval != enable_octomap_updates_) {
-        enable_octomap_updates_ = newval;
-        RCLCPP_INFO_STREAM(node_->get_logger(), "Updated enable_octomap_updates to " << enable_octomap_updates_);
-        // If enabling now and we have no octree yet, we will wait for the next map.
-        // If disabling, just avoid rebuilding graph on new maps.
-      }
     }
   }
   result.successful = true;
