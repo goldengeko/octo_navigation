@@ -268,6 +268,11 @@ private:
   double centroid_lambda_ = 1.0;        // lambda multiplier for local resolution threshold
   double centroid_penalty_weight_ = 2.0;// penalty weight applied when centroid shift indicates edge
 
+  // Spherical (3D) penalty spread parameters: when a node receives a penalty,
+  // spread a fraction of that penalty to other nodes within this 3D radius.
+  double penalty_spread_radius_ = 0.0;   // meters (sphere radius)
+  double penalty_spread_factor_ = 0.0;  // fraction of penalty to distribute among neighbors (0..1)
+
   // Hash function for tuple<int, int, int> to track unique occupied voxels
   struct TupleHash {
     template <typename T1, typename T2, typename T3>
@@ -301,6 +306,9 @@ private:
   // Marker publisher for graph visualization
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr graph_marker_pub_;
   bool publish_graph_markers_ = true;
+  // When false, incoming octomap messages are ignored and the background
+  // graph rebuild timer will not rebuild the graph. Subscription remains active.
+  bool enable_octomap_updates_ = true;
 
   // Build a sampling-based connectivity graph over interior empty nodes.
   // eps: small epsilon distance (meters) to sample just outside node boundaries.
