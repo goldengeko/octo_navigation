@@ -268,6 +268,10 @@ private:
   double centroid_lambda_ = 1.0;        // lambda multiplier for local resolution threshold
   double centroid_penalty_weight_ = 2.0;// penalty weight applied when centroid shift indicates edge
 
+  // Penalty spread
+  double penalty_spread_radius_ = 0.0; // meters, radius within which to spread a fraction of the penalty
+  double penalty_spread_factor_ = 0.0; // fraction [0..1] of the penalty to distribute among neighbors
+
   // Hash function for tuple<int, int, int> to track unique occupied voxels
   struct TupleHash {
     template <typename T1, typename T2, typename T3>
@@ -304,6 +308,9 @@ private:
   // When false, incoming octomap messages are ignored and the background
   // graph rebuild timer will not rebuild the graph. Subscription stays active.
   bool enable_octomap_updates_ = true;
+
+  // Octomap topic name (configurable)
+  std::string octomap_topic_ = std::string("/navigation/octomap_full");
 
   // Build a sampling-based connectivity graph over interior empty nodes.
   // eps: small epsilon distance (meters) to sample just outside node boundaries.

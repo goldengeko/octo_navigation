@@ -93,7 +93,7 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
   // have one yet, return failure instead of falling back to a dense occupancy
   // grid (which has been removed to avoid large allocations).
   if (!octree_) {
-    RCLCPP_WARN(node_->get_logger(), "No octomap available; cannot plan. Waiting for /navigation/octomap_binary.");
+    RCLCPP_WARN(node_->get_logger(), "No octomap available; cannot plan. Waiting for %s", octomap_topic_.c_str());
     return mbf_msgs::action::GetPath::Result::FAILURE;
   }
 
@@ -1165,8 +1165,11 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
 
   path_pub_ = node_->create_publisher<nav_msgs::msg::Path>("~/path", rclcpp::QoS(1).transient_local());
   // Subscribe to octomap binary topic (primary map source)
+
+  // Declare and use a configurable octomap topic name (allows changing topic at runtime)
+  octomap_topic_ = node_->declare_parameter(name_ + ".octomap_topic", octomap_topic_);
   octomap_sub_ = node_->create_subscription<octomap_msgs::msg::Octomap>(
-    "/navigation/octomap_full", 1,
+    octomap_topic_, 1,
     std::bind(&AstarOctoPlanner::octomapCallback, this, std::placeholders::_1));
 
   // parameter: enable/disable processing of incoming octomap updates while
@@ -1198,6 +1201,10 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   centroid_k_ = node_->declare_parameter(name_ + ".centroid_k", centroid_k_);
   centroid_lambda_ = node_->declare_parameter(name_ + ".centroid_lambda", centroid_lambda_);
   centroid_penalty_weight_ = node_->declare_parameter(name_ + ".centroid_penalty_weight", centroid_penalty_weight_);
+
+  // Penalty spread parameters (spread detected penalties to neighbors)
+  penalty_spread_radius_ = node_->declare_parameter(name_ + ".penalty_spread_radius", penalty_spread_radius_);
+  penalty_spread_factor_ = node_->declare_parameter(name_ + ".penalty_spread_factor", penalty_spread_factor_);
 
 
   // Graph marker publishing (for RViz visualization of node centers)
@@ -1409,6 +1416,27 @@ rcl_interfaces::msg::SetParametersResult AstarOctoPlanner::reconfigureCallback(s
           graph_dirty_ = false;
         }
       }
+    } else if (parameter.get_name() == name_ + ".octomap_topic") {
+      std::string new_topic = parameter.as_string();
+      if (new_topic != octomap_topic_) {
+        RCLCPP_INFO_STREAM(node_->get_logger(), "octomap_topic changed from '" << octomap_topic_ << "' to '" << new_topic << "' -> recreating subscription.");
+        octomap_topic_ = new_topic;
+        // recreate subscription on new topic
+        try {
+          octomap_sub_.reset();
+          octomap_sub_ = node_->create_subscription<octomap_msgs::msg::Octomap>(
+            octomap_topic_, 1,
+            std::bind(&AstarOctoPlanner::octomapCallback, this, std::placeholders::_1));
+        } catch (const std::exception &e) {
+          RCLCPP_ERROR(node_->get_logger(), "Failed to recreate octomap subscription on '%s': %s", octomap_topic_.c_str(), e.what());
+        }
+      }
+    } else if (parameter.get_name() == name_ + ".penalty_spread_radius") {
+      penalty_spread_radius_ = parameter.as_double();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated penalty_spread_radius to " << penalty_spread_radius_);
+    } else if (parameter.get_name() == name_ + ".penalty_spread_factor") {
+      penalty_spread_factor_ = parameter.as_double();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated penalty_spread_factor to " << penalty_spread_factor_);
     }
   }
   result.successful = true;
