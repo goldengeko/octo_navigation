@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <chrono>
 
 PLUGINLIB_EXPORT_CLASS(astar_octo_planner::AstarOctoPlanner, mbf_octo_core::OctoPlanner);
 
@@ -233,6 +234,7 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
           gscore[start_id] = 0.0;
 
           std::vector<std::string> path_ids;
+          auto t_astar_start = std::chrono::steady_clock::now();
           // A* loop
           while (!openq.empty()) {
             PQItem cur = openq.top(); openq.pop();
@@ -262,6 +264,9 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
               }
             }
           }
+          auto t_astar_end = std::chrono::steady_clock::now();
+          double dur_astar = std::chrono::duration_cast<std::chrono::duration<double>>(t_astar_end - t_astar_start).count();
+          RCLCPP_INFO(node_->get_logger(), "A* search took %.3f s, expanded=%zu nodes", dur_astar, expanded_set.size());
 
       if (path_ids.empty()) {
         RCLCPP_WARN(node_->get_logger(), "No path found on graph between %s and %s — aborting (NO_PATH_FOUND)", start_id.c_str(), goal_id.c_str());
@@ -434,6 +439,7 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
 
 void AstarOctoPlanner::buildConnectivityGraph(double eps)
 {
+  auto t_graph_start = std::chrono::steady_clock::now();
   graph_nodes_.clear();
   graph_adj_.clear();
   if (!octree_) return;
@@ -637,14 +643,18 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
     publishGraphMarkers();
   }
 
+  auto t_graph_structure_end = std::chrono::steady_clock::now();
+  double dur_graph_structure = std::chrono::duration_cast<std::chrono::duration<double>>(t_graph_structure_end - t_graph_start).count();
+  RCLCPP_INFO(node_->get_logger(), "Graph build (structure only) took %.3f s (nodes=%zu)", dur_graph_structure, graph_nodes_.size());
+
   // ---------------------------------------------------------------------------
   // Precompute base node penalties for the whole graph. This avoids recomputing
   // expensive detectors during A* and stabilizes visualization. We compute only
-  // base penalties here (no spread/inflation) — inflation can be applied later
-  // once you've decided semantics.
+  // base penalties here (no spread/inflation)
   graph_node_penalty_.clear();
   graph_penalized_nodes_.clear();
   // Compute base penalties using the same detectors as used during planning
+  auto t_pen_start = std::chrono::steady_clock::now();
   for (const auto &kv : graph_nodes_) {
     const std::string nid = kv.first;
     const GraphNode &n = kv.second;
@@ -692,57 +702,64 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
       }
     }
 
-    // sector-histogram detector (fast)
-    std::vector<std::pair<double,double>> pts_sector;
-    for (const auto &kv2 : graph_nodes_) {
-      if (kv2.first == nid) continue;
-      double dx = kv2.second.center.x() - n.center.x();
-      double dy = kv2.second.center.y() - n.center.y();
-      double dxy = std::sqrt(dx*dx + dy*dy);
-      if (dxy <= sector_radius_) pts_sector.emplace_back(dx, dy);
-    }
-    if (pts_sector.size() >= static_cast<size_t>(sector_min_inliers_)) {
-      std::vector<int> hist(sector_bins_, 0);
-      for (const auto &pp : pts_sector) {
-        double ang = std::atan2(pp.second, pp.first);
-        if (ang < 0) ang += 2.0 * M_PI;
-        int bin = static_cast<int>(std::floor((ang / (2.0 * M_PI)) * sector_bins_)) % sector_bins_;
-        if (bin < 0) bin += sector_bins_;
-        hist[bin]++;
-      }
-      int max_idx = 0, second_idx = -1; int max_val = hist[0];
-      for (int i = 1; i < sector_bins_; ++i) {
-        if (hist[i] > max_val) { second_idx = max_idx; max_idx = i; max_val = hist[i]; }
-        else if (second_idx < 0 || hist[i] > hist[second_idx]) { second_idx = i; }
-      }
-      double frac = static_cast<double>(max_val) / static_cast<double>(pts_sector.size());
-      if (frac >= sector_peak_thresh_) {
-        double mean_dist = 0.0; int cnt = 0;
-        double ang_low = (static_cast<double>(max_idx) / sector_bins_) * 2.0 * M_PI;
-        double ang_high = (static_cast<double>(max_idx + 1) / sector_bins_) * 2.0 * M_PI;
-        for (const auto &pp : pts_sector) {
-          double ang = std::atan2(pp.second, pp.first);
-          if (ang < 0) ang += 2.0 * M_PI;
-          double a = ang;
-          if (a >= ang_low && a < ang_high) { mean_dist += std::sqrt(pp.first*pp.first + pp.second*pp.second); ++cnt; }
-        }
-        if (cnt > 0) mean_dist /= static_cast<double>(cnt); else mean_dist = sector_radius_;
-        double wall_pen = wall_penalty_weight_ * std::exp(-mean_dist / (0.5 * sector_radius_));
-        penalty += wall_pen;
-        if (second_idx >= 0 && hist[second_idx] > 0) {
-          double frac2 = static_cast<double>(hist[second_idx]) / static_cast<double>(pts_sector.size());
-          int diff = std::abs(max_idx - second_idx);
-          if (diff > sector_bins_/4 && (frac2 >= (sector_peak_thresh_ * 0.6))) {
-            penalty += corner_penalty_weight_;
-            graph_penalized_nodes_.insert(nid);
-          }
-        }
-      }
-    }
+    // sector-histogram detector (fast) temporarily disabled to benchmark centroid detector
+    // std::vector<std::pair<double,double>> pts_sector;
+    // for (const auto &kv2 : graph_nodes_) {
+    //   if (kv2.first == nid) continue;
+    //   double dx = kv2.second.center.x() - n.center.x();
+    //   double dy = kv2.second.center.y() - n.center.y();
+    //   double dxy = std::sqrt(dx*dx + dy*dy);
+    //   if (dxy <= sector_radius_) pts_sector.emplace_back(dx, dy);
+    // }
+    // if (pts_sector.size() >= static_cast<size_t>(sector_min_inliers_)) {
+    //   std::vector<int> hist(sector_bins_, 0);
+    //   for (const auto &pp : pts_sector) {
+    //     double ang = std::atan2(pp.second, pp.first);
+    //     if (ang < 0) ang += 2.0 * M_PI;
+    //     int bin = static_cast<int>(std::floor((ang / (2.0 * M_PI)) * sector_bins_)) % sector_bins_;
+    //     if (bin < 0) bin += sector_bins_;
+    //     hist[bin]++;
+    //   }
+    //   int max_idx = 0, second_idx = -1; int max_val = hist[0];
+    //   for (int i = 1; i < sector_bins_; ++i) {
+    //     if (hist[i] > max_val) { second_idx = max_idx; max_idx = i; max_val = hist[i]; }
+    //     else if (second_idx < 0 || hist[i] > hist[second_idx]) { second_idx = i; }
+    //   }
+    //   double frac = static_cast<double>(max_val) / static_cast<double>(pts_sector.size());
+    //   if (frac >= sector_peak_thresh_) {
+    //     double mean_dist = 0.0; int cnt = 0;
+    //     double ang_low = (static_cast<double>(max_idx) / sector_bins_) * 2.0 * M_PI;
+    //     double ang_high = (static_cast<double>(max_idx + 1) / sector_bins_) * 2.0 * M_PI;
+    //     for (const auto &pp : pts_sector) {
+    //       double ang = std::atan2(pp.second, pp.first);
+    //       if (ang < 0) ang += 2.0 * M_PI;
+    //       double a = ang;
+    //       if (a >= ang_low && a < ang_high) { mean_dist += std::sqrt(pp.first*pp.first + pp.second*pp.second); ++cnt; }
+    //     }
+    //     if (cnt > 0) mean_dist /= static_cast<double>(cnt); else mean_dist = sector_radius_;
+    //     double wall_pen = wall_penalty_weight_ * std::exp(-mean_dist / (0.5 * sector_radius_));
+    //     penalty += wall_pen;
+    //     if (second_idx >= 0 && hist[second_idx] > 0) {
+    //       double frac2 = static_cast<double>(hist[second_idx]) / static_cast<double>(pts_sector.size());
+    //       int diff = std::abs(max_idx - second_idx);
+    //       if (diff > sector_bins_/4 && (frac2 >= (sector_peak_thresh_ * 0.6))) {
+    //         penalty += corner_penalty_weight_;
+    //         graph_penalized_nodes_.insert(nid);
+    //       }
+    //     }
+    //   }
+    // }
 
     graph_node_penalty_[nid] = penalty;
     if (penalty > 1e-9) graph_penalized_nodes_.insert(nid);
   }
+  auto t_pen_end = std::chrono::steady_clock::now();
+  double dur_pen = std::chrono::duration_cast<std::chrono::duration<double>>(t_pen_end - t_pen_start).count();
+  RCLCPP_INFO(node_->get_logger(), "Penalty computation took %.3f s", dur_pen);
+
+  auto t_graph_end = std::chrono::steady_clock::now();
+  double dur_graph_total = std::chrono::duration_cast<std::chrono::duration<double>>(t_graph_end - t_graph_start).count();
+  RCLCPP_INFO(node_->get_logger(), "Total buildConnectivityGraph() took %.3f s", dur_graph_total);
 
 }
 
