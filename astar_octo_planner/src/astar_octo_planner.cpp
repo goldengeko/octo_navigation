@@ -191,390 +191,77 @@ uint32_t AstarOctoPlanner::makePlan(const geometry_msgs::msg::PoseStamped& start
       // Copy graph data under lock so we can run expensive checks without holding the mutex.
       std::unordered_map<std::string, GraphNode> local_nodes;
       std::unordered_map<std::string, std::vector<std::string>> local_adj;
+      std::unordered_map<std::string, double> local_node_penalty;
+      std::unordered_set<std::string> local_penalized_nodes;
       {
         std::lock_guard<std::mutex> lock(graph_mutex_);
         local_nodes = graph_nodes_;
         local_adj = graph_adj_;
+        // copy precomputed penalties
+        local_node_penalty = graph_node_penalty_;
+        local_penalized_nodes = graph_penalized_nodes_;
       }
 
-      // Prefer a start node that lies in front of the robot (based on start orientation)
-      // Compute yaw from start_in_map.pose.orientation
-      auto q = start_in_map.pose.orientation;
-      double qx = q.x; double qy = q.y; double qz = q.z; double qw = q.w;
-      double siny = 2.0 * (qw * qz + qx * qy);
-      double cosy = 1.0 - 2.0 * (qy * qy + qz * qz);
-      double yaw = std::atan2(siny, cosy);
-      // forward cone threshold (radians)
-      const double cone_deg = 60.0;
-      const double cone_thresh = cone_deg * M_PI / 180.0;
-      // attempt to find nearest node inside forward cone (within a reasonable distance)
-      double bestd = std::numeric_limits<double>::infinity();
-      std::string best_forward_id;
-      octomap::point3d spt(start_world.x, start_world.y, start_world.z);
-      for (const auto &kv : local_nodes) {
-        const std::string &nid = kv.first;
-        const auto &n = kv.second;
-        double vx = n.center.x() - spt.x();
-        double vy = n.center.y() - spt.y();
-        double d = std::sqrt(vx*vx + vy*vy);
-        if (d < 1e-9) { best_forward_id = nid; break; }
-        double ang = std::atan2(vy, vx);
-        double diff = ang - yaw;
-        // normalize to [-pi,pi]
-        while (diff > M_PI) diff -= 2.0*M_PI;
-        while (diff < -M_PI) diff += 2.0*M_PI;
-        if (std::fabs(diff) <= cone_thresh) {
-          if (d < bestd) { bestd = d; best_forward_id = nid; }
-        }
-      }
-      if (!best_forward_id.empty()) {
-        RCLCPP_INFO(node_->get_logger(), "Selected forward-biased start node: %s (dist=%.3f)", best_forward_id.c_str(), bestd);
-        start_id = best_forward_id;
-      } else {
-        RCLCPP_INFO(node_->get_logger(), "No forward node found within %.1f deg cone — using nearest start node %s", cone_deg, start_id.c_str());
-      }
+          // Prepare per-plan containers for search and visualization.
+          std::unordered_set<std::string> expanded_set;
+          std::unordered_map<std::string, double> gscore;
+          std::unordered_map<std::string, std::string> came_from;
+          struct PQItem { std::string id; double f; double g; };
+          struct PQCmp { bool operator()(const PQItem &a, const PQItem &b) const { return a.f > b.f; } };
+          std::priority_queue<PQItem, std::vector<PQItem>, PQCmp> openq;
 
-      // Per-plan caches
-      std::unordered_map<std::string, bool> node_ok; // node_id -> valid for robot
-      std::unordered_map<std::string, bool> edge_ok; // "a|b" -> valid
-  // per-plan corner penalty cache
-  std::unordered_map<std::string, double> node_penalty;
-  // record nodes that received a non-zero penalty during neighbor evaluation
-  std::unordered_set<std::string> penalized_nodes;
-
-      // Insert temporary start/goal nodes into local graph to ensure connection
-      // compute temporary node ids
-      const std::string tmp_start_id = "__tmp_start";
-      const std::string tmp_goal_id = "__tmp_goal";
-      octomap::point3d start_pt(start_world.x, start_world.y, start_world.z);
-      octomap::point3d goal_pt(goal_world.x, goal_world.y, goal_world.z);
-      GraphNode sgn;
-      sgn.center = start_pt;
-      sgn.depth = local_nodes.empty() ? octree_->getTreeDepth() : local_nodes.begin()->second.depth;
-      sgn.size = active_voxel_size_;
-      GraphNode ggn;
-      ggn.center = goal_pt;
-      ggn.depth = sgn.depth;
-      ggn.size = active_voxel_size_;
-      local_nodes[tmp_start_id] = sgn;
-      local_nodes[tmp_goal_id] = ggn;
-      // connect tmp nodes to nearby nodes within radius
-      double conn_radius = std::max(0.5, 2.0 * robot_radius_);
-      for (const auto &kv : local_nodes) {
-        const std::string &nid = kv.first;
-        if (nid == tmp_start_id || nid == tmp_goal_id) continue;
-        double ds = local_nodes[nid].center.distance(start_pt);
-        if (ds <= conn_radius) local_adj[tmp_start_id].push_back(nid), local_adj[nid].push_back(tmp_start_id);
-        double dg = local_nodes[nid].center.distance(goal_pt);
-        if (dg <= conn_radius) local_adj[tmp_goal_id].push_back(nid), local_adj[nid].push_back(tmp_goal_id);
-      }
-
-      // helper: convert world point to grid index tuple (matching earlier logic)
-      auto worldPointToGrid = [&](const octomap::point3d &pt)->std::tuple<int,int,int> {
-        int gx = static_cast<int>(std::floor((pt.x() - min_bound_[0]) / active_voxel_size_ + 0.5));
-        int gy = static_cast<int>(std::floor((pt.y() - min_bound_[1]) / active_voxel_size_ + 0.5));
-        int gz = static_cast<int>(std::floor((pt.z() - min_bound_[2]) / active_voxel_size_ + 0.5));
-        return {gx, gy, gz};
-      };
-
-      // helper: check node clearance (vertical + footprint)
-      auto isNodeClear = [&](const std::string &nid)->bool {
-        if (node_ok.find(nid) != node_ok.end()) return node_ok[nid];
-        if (local_nodes.find(nid) == local_nodes.end()) { node_ok[nid] = false; return false; }
-        const auto &gn = local_nodes.at(nid);
-        // vertical clearance: from node center up to robot_height_
-        double z0 = gn.center.z();
-        double ztop = z0 + robot_height_;
-        double stepz = std::max(active_voxel_size_, 0.05);
-        for (double z = z0; z <= ztop; z += stepz) {
-          octomap::OcTreeNode* n = octree_->search(gn.center.x(), gn.center.y(), z);
-          if (n && octree_->isNodeOccupied(n)) { node_ok[nid] = false; return false; }
-        }
-        // footprint check: reuse existing isCylinderCollisionFree which expects grid idx
-        auto gidx = worldPointToGrid(gn.center);
-        bool ok = true; //isCylinderCollisionFree(gidx, robot_radius_);
-        node_ok[nid] = ok;
-        return ok;
-      };
-
-      // helper: check edge clearance by sampling along segment and checking footprint + occupancy
-      auto isEdgeClear = [&](const std::string &a, const std::string &b)->bool {
-        std::string key = a + "|" + b;
-        if (edge_ok.find(key) != edge_ok.end()) return edge_ok[key];
-        if (local_nodes.find(a) == local_nodes.end() || local_nodes.find(b) == local_nodes.end()) { edge_ok[key] = false; return false; }
-        const auto &na = local_nodes.at(a);
-        const auto &nb = local_nodes.at(b);
-        octomap::point3d A = na.center;
-        octomap::point3d B = nb.center;
-        octomap::point3d dir = B - A;
-        double dist = dir.norm();
-        if (dist <= 1e-9) { edge_ok[key] = true; return true; }
-        dir /= dist;
-        double step = std::max(active_voxel_size_, 0.05);
-        int steps = std::max(1, static_cast<int>(std::ceil(dist / step)));
-        // sample interior points to check occupancy and footprint
-        for (int si = 1; si < steps; ++si) {
-          double t = static_cast<double>(si) / static_cast<double>(steps);
-          octomap::point3d s = A + dir * (dist * t);
-          // bounds
-          const double eps = 1e-6;
-          if (s.x() < min_bound_[0] - eps || s.x() > max_bound_[0] + eps ||
-              s.y() < min_bound_[1] - eps || s.y() > max_bound_[1] + eps ||
-              s.z() < min_bound_[2] - eps || s.z() > max_bound_[2] + eps) continue;
-          // quick occupancy check
-          octomap::OcTreeNode* nn = octree_->search(s.x(), s.y(), s.z());
-          if (nn && octree_->isNodeOccupied(nn)) { edge_ok[key] = false; return false; }
-          // footprint clearance at this sample
-          auto g = worldPointToGrid(s);
-          //if (!isCylinderCollisionFree(g, robot_radius_)) { edge_ok[key] = false; return false; }
-        }
-        edge_ok[key] = true;
-        return true;
-      };
-
-      // local A* using the local graph and lazy validation
-      struct Item { std::string id; double f; double g; };
-      struct Cmp { bool operator()(const Item&a, const Item&b) const { return a.f > b.f; } };
-  std::priority_queue<Item, std::vector<Item>, Cmp> openq;
-  std::unordered_map<std::string, double> gscore;
-  std::unordered_map<std::string, std::string> came_from;
-  std::unordered_set<std::string> expanded_set;
-
-      auto heuristic_local = [&](const std::string &a)->double{
-        if (local_nodes.find(a) == local_nodes.end() || local_nodes.find(goal_id) == local_nodes.end()) return 0.0;
-        const auto &pa = local_nodes.at(a).center;
-        const auto &pg = local_nodes.at(goal_id).center;
-        double dx = pa.x()-pg.x(); double dy = pa.y()-pg.y(); double dz = pa.z()-pg.z();
-        return std::sqrt(dx*dx+dy*dy+dz*dz);
-      };
-
-      // initialize
-      openq.push({start_id, heuristic_local(start_id), 0.0});
-      gscore[start_id] = 0.0;
-
-      std::vector<std::string> path_ids;
-      while (!openq.empty()) {
-        Item cur = openq.top(); openq.pop();
-        if (cur.id == goal_id) {
-          // reconstruct
-          std::string u = goal_id;
-          while (came_from.find(u) != came_from.end()) { path_ids.push_back(u); u = came_from.at(u); }
-          path_ids.push_back(start_id);
-          std::reverse(path_ids.begin(), path_ids.end());
-          break;
-        }
-  if (gscore.find(cur.id) != gscore.end() && cur.g > gscore.at(cur.id)) continue; // stale
-  // mark node as expanded for debugging/visualization
-  expanded_set.insert(cur.id);
-        auto it2 = local_adj.find(cur.id);
-        if (it2 == local_adj.end()) continue;
-        for (const std::string &nb : it2->second) {
-          if (local_nodes.find(cur.id) == local_nodes.end() || local_nodes.find(nb) == local_nodes.end()) continue;
-          // lazy validate node and edge
-          if (!isNodeClear(nb)) continue;
-          if (!isEdgeClear(cur.id, nb)) continue;
-          // compute basic move cost
-          double move_cost = local_nodes.at(cur.id).center.distance(local_nodes.at(nb).center);
-          // compute a sector-histogram based wall/corner penalty (2D) with RANSAC fallback
-          auto computeCornerPenalty = [&](const std::string &nid)->double {
-            auto itp = node_penalty.find(nid);
-            if (itp != node_penalty.end()) return itp->second;
-            const auto &n = local_nodes.at(nid);
-            // collect neighbors for sector histogram (sector_radius_) and for RANSAC (ransac_radius_)
-            std::vector<std::pair<double,double>> pts_ransac;
-            std::vector<std::pair<double,double>> pts_sector;
-            for (const auto &kv2 : local_nodes) {
-              if (kv2.first == nid) continue;
-              double dx = kv2.second.center.x() - n.center.x();
-              double dy = kv2.second.center.y() - n.center.y();
-              double dxy = std::sqrt(dx*dx + dy*dy);
-              if (dxy <= ransac_radius_) pts_ransac.emplace_back(dx, dy);
-              if (dxy <= sector_radius_) pts_sector.emplace_back(dx, dy);
-            }
-            double penalty = 0.0;
-
-            // Centroid-shift (mean-shift inspired) edge detector
-            // For the tested node, compute centroid of up to centroid_k_ nearest neighbors
-            if (pts_ransac.size() >= 4) {
-              // build a vector of neighbor full positions using local_nodes
-              std::vector<octomap::point3d> nbrs;
-              nbrs.reserve(pts_ransac.size());
-              for (const auto &kv2 : local_nodes) {
-                if (kv2.first == nid) continue;
-                double dx = kv2.second.center.x() - n.center.x();
-                double dy = kv2.second.center.y() - n.center.y();
-                double dxy = std::sqrt(dx*dx + dy*dy);
-                if (dxy <= ransac_radius_) nbrs.push_back(kv2.second.center);
-              }
-              // sort by XY distance and keep top-k
-              std::sort(nbrs.begin(), nbrs.end(), [&](const octomap::point3d &a, const octomap::point3d &b){
-                double da = std::hypot(a.x()-n.center.x(), a.y()-n.center.y());
-                double db = std::hypot(b.x()-n.center.x(), b.y()-n.center.y());
-                return da < db;
-              });
-              if (!nbrs.empty()) {
-                size_t k_use = std::min(static_cast<size_t>(centroid_k_), nbrs.size());
-                // compute centroid C over k_use nearest
-                double cx=0, cy=0, cz=0;
-                for (size_t ii=0; ii<k_use; ++ii) { cx += nbrs[ii].x(); cy += nbrs[ii].y(); cz += nbrs[ii].z(); }
-                cx /= static_cast<double>(k_use); cy /= static_cast<double>(k_use); cz /= static_cast<double>(k_use);
-                double shift = std::sqrt((cx - n.center.x())*(cx - n.center.x()) + (cy - n.center.y())*(cy - n.center.y()) + (cz - n.center.z())*(cz - n.center.z()));
-                // compute local resolution Z_i as min distance from node to these k neighbors
-                double Zi = 1e9; for (size_t ii=0; ii<k_use; ++ii) {
-                  double dd = std::sqrt((nbrs[ii].x()-n.center.x())*(nbrs[ii].x()-n.center.x()) + (nbrs[ii].y()-n.center.y())*(nbrs[ii].y()-n.center.y()) + (nbrs[ii].z()-n.center.z())*(nbrs[ii].z()-n.center.z()));
-                  Zi = std::min(Zi, dd);
-                }
-                if (Zi < 1e-6) Zi = active_voxel_size_;
-                if (shift > centroid_lambda_ * Zi) {
-                  // classified as edge point; add centroid penalty
-                  penalty += centroid_penalty_weight_;
-                  penalized_nodes.insert(nid);
-                } else {
-                  // corner indicator: check spread in x,y,z among k neighbors
-                  double minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,minz=1e9,maxz=-1e9;
-                  for (size_t ii=0; ii<k_use; ++ii) {
-                    double vx = nbrs[ii].x(); double vy = nbrs[ii].y(); double vz = nbrs[ii].z();
-                    if (vx < minx) minx = vx; if (vx > maxx) maxx = vx;
-                    if (vy < miny) miny = vy; if (vy > maxy) maxy = vy;
-                    if (vz < minz) minz = vz; if (vz > maxz) maxz = vz;
-                  }
-                  int axes = 0; double rho = 0.05; // slack threshold
-                  if ((maxx - minx) > rho) ++axes; if ((maxy - miny) > rho) ++axes; if ((maxz - minz) > rho) ++axes;
-                  if (axes >= 2) { penalty += 0.5 * centroid_penalty_weight_; penalized_nodes.insert(nid); }
-                }
-              }
-            }
-
-            // Sector histogram detector (fast, deterministic)
-            if (pts_sector.size() >= static_cast<size_t>(sector_min_inliers_)) {
-              std::vector<int> hist(sector_bins_, 0);
-              for (const auto &pp : pts_sector) {
-                double ang = std::atan2(pp.second, pp.first);
-                if (ang < 0) ang += 2.0 * M_PI;
-                int bin = static_cast<int>(std::floor((ang / (2.0 * M_PI)) * sector_bins_)) % sector_bins_;
-                if (bin < 0) bin += sector_bins_;
-                hist[bin]++;
-              }
-              // find top two peaks
-              int max_idx = 0, second_idx = -1;
-              int max_val = hist[0];
-              for (int i = 1; i < sector_bins_; ++i) {
-                if (hist[i] > max_val) { second_idx = max_idx; max_idx = i; max_val = hist[i]; }
-                else if (second_idx < 0 || hist[i] > hist[second_idx]) { second_idx = i; }
-              }
-              double frac = static_cast<double>(max_val) / static_cast<double>(pts_sector.size());
-              if (frac >= sector_peak_thresh_) {
-                // strong wall in direction of max_idx -> moderate wall penalty
-                // compute average distance of points in the dominant bin
-                double mean_dist = 0.0; int cnt = 0;
-                double ang_low = (static_cast<double>(max_idx) / sector_bins_) * 2.0 * M_PI;
-                double ang_high = (static_cast<double>(max_idx + 1) / sector_bins_) * 2.0 * M_PI;
-                for (const auto &pp : pts_sector) {
-                  double ang = std::atan2(pp.second, pp.first);
-                  if (ang < 0) ang += 2.0 * M_PI;
-                  // check bin membership (wrap-aware)
-                  double a = ang;
-                  if (a >= ang_low && a < ang_high) { mean_dist += std::sqrt(pp.first*pp.first + pp.second*pp.second); ++cnt; }
-                }
-                if (cnt > 0) mean_dist /= static_cast<double>(cnt);
-                else mean_dist = sector_radius_;
-                double wall_pen = wall_penalty_weight_ * std::exp(-mean_dist / (0.5 * sector_radius_));
-                penalty += wall_pen;
-
-                // check for a second significant peak to indicate a corner (angularly separated)
-                if (second_idx >= 0 && hist[second_idx] > 0) {
-                  double frac2 = static_cast<double>(hist[second_idx]) / static_cast<double>(pts_sector.size());
-                  // compute angular separation
-                  int diff = std::abs(max_idx - second_idx);
-                  if (diff > sector_bins_/4 && (frac2 >= (sector_peak_thresh_ * 0.6))) {
-                    // treat as corner -> add corner penalty
-                    penalty += corner_penalty_weight_;
-                  }
-                }
-              }
-            }
-
-
-
-            // Fallback: if sector detector didn't provide enough evidence, use RANSAC (existing logic)
-            if (penalty <= 1e-9 && pts_ransac.size() >= static_cast<size_t>(ransac_min_inliers_)) {
-              std::mt19937 rng(123456);
-              size_t best_inliers = 0;
-              double best_m=0, best_c=0;
-              for (int iters=0; iters < ransac_iterations_; ++iters) {
-                std::uniform_int_distribution<size_t> dist(0, pts_ransac.size()-1);
-                size_t i1 = dist(rng); size_t i2 = dist(rng);
-                if (i1 == i2) continue;
-                auto p1 = pts_ransac[i1]; auto p2 = pts_ransac[i2];
-                double dx = p2.first - p1.first; double dy = p2.second - p1.second;
-                if (std::fabs(dx) < 1e-6 && std::fabs(dy) < 1e-6) continue;
-                double m = 0.0, c = 0.0;
-                bool vertical = std::fabs(dx) < 1e-6 && std::fabs(dy) > 1e-6;
-                if (!vertical) { m = dy / dx; c = p1.second - m * p1.first; }
-                size_t inliers = 0;
-                for (const auto &pp : pts_ransac) {
-                  double x = pp.first, y = pp.second;
-                  double dist_to_line = 0.0;
-                  if (!vertical) {
-                    double y_est = m * x + c; dist_to_line = std::fabs(y - y_est);
-                  } else { double x0 = p1.first; dist_to_line = std::fabs(x - x0); }
-                  if (dist_to_line <= ransac_dist_thresh_) ++inliers;
-                }
-                if (inliers > best_inliers) { best_inliers = inliers; best_m = m; best_c = c; }
-              }
-              if (best_inliers >= static_cast<size_t>(ransac_min_inliers_)) {
-                double dist_center = 1e9;
-                if (std::fabs(best_m) < 1e9) {
-                  double x0 = 0.0, y0 = 0.0; double y_est = best_m * x0 + best_c; dist_center = std::fabs(y0 - y_est);
-                }
-                double wall_pen = wall_penalty_weight_ * std::exp(-dist_center / (0.5 * ransac_radius_));
-                penalty += wall_pen;
-                // residual-based corner detection (second line)
-                std::vector<std::pair<double,double>> residuals;
-                for (const auto &pp : pts_ransac) {
-                  double x = pp.first, y = pp.second;
-                  double y_est = best_m * x + best_c; double d = std::fabs(y - y_est);
-                  if (d > ransac_dist_thresh_) residuals.push_back(pp);
-                }
-                if (residuals.size() >= static_cast<size_t>(ransac_min_inliers_)) {
-                  size_t best2_in = 0; double best2_m=0, best2_c=0;
-                  std::mt19937 rng2(654321);
-                  for (int it2=0; it2 < ransac_iterations_; ++it2) {
-                    std::uniform_int_distribution<size_t> dist2(0, residuals.size()-1);
-                    size_t j1 = dist2(rng2); size_t j2 = dist2(rng2);
-                    if (j1==j2) continue;
-                    auto q1 = residuals[j1]; auto q2 = residuals[j2];
-                    double dx = q2.first - q1.first; double dy = q2.second - q1.second;
-                    if (std::fabs(dx) < 1e-6 && std::fabs(dy) < 1e-6) continue;
-                    double m2 = dy / dx; double c2 = q1.second - m2 * q1.first;
-                    size_t in2 = 0;
-                    for (const auto &qq : residuals) { double y2 = m2 * qq.first + c2; if (std::fabs(qq.second - y2) <= ransac_dist_thresh_) ++in2; }
-                    if (in2 > best2_in) { best2_in = in2; best2_m = m2; best2_c = c2; }
-                  }
-                  if (best2_in >= static_cast<size_t>(ransac_min_inliers_)) {
-                    double ang1 = std::atan(best_m); double ang2 = std::atan(best2_m);
-                    double angdiff = std::fabs(ang1 - ang2) * 180.0 / M_PI;
-                    while (angdiff > 180.0) angdiff -= 360.0;
-                    if (angdiff < 0) angdiff = -angdiff;
-                    if (angdiff > corner_angle_thresh_deg_ && angdiff < (180.0 - corner_angle_thresh_deg_)) penalty += corner_penalty_weight_;
-                  }
-                }
-              }
-            }
-
-            node_penalty[nid] = penalty;
-            if (penalty > 1e-6) penalized_nodes.insert(nid);
-            return penalty;
+          auto heuristic_local = [&](const std::string &a)->double{
+            if (local_nodes.find(a) == local_nodes.end() || local_nodes.find(goal_id) == local_nodes.end()) return 0.0;
+            const auto &pa = local_nodes.at(a).center;
+            const auto &pg = local_nodes.at(goal_id).center;
+            double dx = pa.x()-pg.x(); double dy = pa.y()-pg.y(); double dz = pa.z()-pg.z();
+            return std::sqrt(dx*dx + dy*dy + dz*dz);
           };
-          double penalty = computeCornerPenalty(nb);
-          double tentative = cur.g + move_cost + penalty;
-          if (gscore.find(nb) == gscore.end() || tentative < gscore[nb]) {
-            came_from[nb] = cur.id;
-            gscore[nb] = tentative;
-            openq.push({nb, tentative + heuristic_local(nb), tentative});
+
+          // keep copies using the exact names other code expects for marker publishing
+          std::unordered_map<std::string,double> node_penalty = local_node_penalty;
+          std::unordered_set<std::string> penalized_nodes = local_penalized_nodes;
+
+          auto getPrecomputedPenalty = [&](const std::string &nid)->double{
+            auto it = local_node_penalty.find(nid);
+            if (it != local_node_penalty.end()) return it->second;
+            return 0.0;
+          };
+
+          // initialize search
+          openq.push({start_id, heuristic_local(start_id), 0.0});
+          gscore[start_id] = 0.0;
+
+          std::vector<std::string> path_ids;
+          // A* loop
+          while (!openq.empty()) {
+            PQItem cur = openq.top(); openq.pop();
+            if (cur.id == goal_id) {
+              // reconstruct path
+              std::string u = goal_id;
+              while (came_from.find(u) != came_from.end()) { path_ids.push_back(u); u = came_from.at(u); }
+              path_ids.push_back(start_id);
+              std::reverse(path_ids.begin(), path_ids.end());
+              break;
+            }
+            if (gscore.find(cur.id) != gscore.end() && cur.g > gscore.at(cur.id)) continue; // stale
+            expanded_set.insert(cur.id);
+            auto it_adj = local_adj.find(cur.id);
+            if (it_adj == local_adj.end()) continue;
+            for (const auto &nb : it_adj->second) {
+              if (local_nodes.find(nb) == local_nodes.end()) continue;
+              double move_cost = local_nodes.at(cur.id).center.distance(local_nodes.at(nb).center);
+              double penalty = getPrecomputedPenalty(nb);
+              node_penalty[nb] = penalty;
+              if (penalty > 1e-9) penalized_nodes.insert(nb);
+              double tentative = cur.g + move_cost + penalty;
+              if (gscore.find(nb) == gscore.end() || tentative < gscore[nb]) {
+                came_from[nb] = cur.id;
+                gscore[nb] = tentative;
+                openq.push({nb, tentative + heuristic_local(nb), tentative});
+              }
+            }
           }
-        }
-      }
 
       if (path_ids.empty()) {
         RCLCPP_WARN(node_->get_logger(), "No path found on graph between %s and %s — aborting (NO_PATH_FOUND)", start_id.c_str(), goal_id.c_str());
@@ -765,7 +452,7 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
   size_t rejected_distance = 0;
   size_t rejected_los = 0;
 
-  // Option 1: Build surface graph from occupied leafs (top face of occupied voxels)
+  //Build surface graph from occupied leafs (top face of occupied voxels)
   for (auto it = octree_->begin_leafs(), end = octree_->end_leafs(); it != end; ++it) {
     ++total_leafs;
     if (!octree_->isNodeOccupied(*it)) continue;
@@ -949,6 +636,114 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
   if (publish_graph_markers_) {
     publishGraphMarkers();
   }
+
+  // ---------------------------------------------------------------------------
+  // Precompute base node penalties for the whole graph. This avoids recomputing
+  // expensive detectors during A* and stabilizes visualization. We compute only
+  // base penalties here (no spread/inflation) — inflation can be applied later
+  // once you've decided semantics.
+  graph_node_penalty_.clear();
+  graph_penalized_nodes_.clear();
+  // Compute base penalties using the same detectors as used during planning
+  for (const auto &kv : graph_nodes_) {
+    const std::string nid = kv.first;
+    const GraphNode &n = kv.second;
+    double penalty = 0.0;
+
+    // centroid-shift detector (k-nearest variant)
+    std::vector<octomap::point3d> nbrs;
+    for (const auto &kv2 : graph_nodes_) {
+      if (kv2.first == nid) continue;
+      double dx = kv2.second.center.x() - n.center.x();
+      double dy = kv2.second.center.y() - n.center.y();
+      double dxy = std::sqrt(dx*dx + dy*dy);
+      if (dxy <= ransac_radius_) nbrs.push_back(kv2.second.center);
+    }
+    if (nbrs.size() >= 4) {
+      std::sort(nbrs.begin(), nbrs.end(), [&](const octomap::point3d &a, const octomap::point3d &b){
+        double da = std::hypot(a.x()-n.center.x(), a.y()-n.center.y());
+        double db = std::hypot(b.x()-n.center.x(), b.y()-n.center.y());
+        return da < db;
+      });
+      size_t k_use = std::min(static_cast<size_t>(centroid_k_), nbrs.size());
+      double cx=0, cy=0, cz=0;
+      for (size_t ii=0; ii<k_use; ++ii) { cx += nbrs[ii].x(); cy += nbrs[ii].y(); cz += nbrs[ii].z(); }
+      cx /= static_cast<double>(k_use); cy /= static_cast<double>(k_use); cz /= static_cast<double>(k_use);
+      double shift = std::sqrt((cx - n.center.x())*(cx - n.center.x()) + (cy - n.center.y())*(cy - n.center.y()) + (cz - n.center.z())*(cz - n.center.z()));
+      double Zi = 1e9; for (size_t ii=0; ii<k_use; ++ii) {
+        double dd = std::sqrt((nbrs[ii].x()-n.center.x())*(nbrs[ii].x()-n.center.x()) + (nbrs[ii].y()-n.center.y())*(nbrs[ii].y()-n.center.y()) + (nbrs[ii].z()-n.center.z())*(nbrs[ii].z()-n.center.z()));
+        Zi = std::min(Zi, dd);
+      }
+      if (Zi < 1e-6) Zi = n.size;
+      if (shift > centroid_lambda_ * Zi) {
+        penalty += centroid_penalty_weight_;
+        graph_penalized_nodes_.insert(nid);
+      } else {
+        double minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,minz=1e9,maxz=-1e9;
+        for (size_t ii=0; ii<k_use; ++ii) {
+          double vx = nbrs[ii].x(); double vy = nbrs[ii].y(); double vz = nbrs[ii].z();
+          if (vx < minx) minx = vx; if (vx > maxx) maxx = vx;
+          if (vy < miny) miny = vy; if (vy > maxy) maxy = vy;
+          if (vz < minz) minz = vz; if (vz > maxz) maxz = vz;
+        }
+        int axes = 0; double rho = 0.05;
+        if ((maxx - minx) > rho) ++axes; if ((maxy - miny) > rho) ++axes; if ((maxz - minz) > rho) ++axes;
+        if (axes >= 2) { penalty += 0.5 * centroid_penalty_weight_; graph_penalized_nodes_.insert(nid); }
+      }
+    }
+
+    // sector-histogram detector (fast)
+    std::vector<std::pair<double,double>> pts_sector;
+    for (const auto &kv2 : graph_nodes_) {
+      if (kv2.first == nid) continue;
+      double dx = kv2.second.center.x() - n.center.x();
+      double dy = kv2.second.center.y() - n.center.y();
+      double dxy = std::sqrt(dx*dx + dy*dy);
+      if (dxy <= sector_radius_) pts_sector.emplace_back(dx, dy);
+    }
+    if (pts_sector.size() >= static_cast<size_t>(sector_min_inliers_)) {
+      std::vector<int> hist(sector_bins_, 0);
+      for (const auto &pp : pts_sector) {
+        double ang = std::atan2(pp.second, pp.first);
+        if (ang < 0) ang += 2.0 * M_PI;
+        int bin = static_cast<int>(std::floor((ang / (2.0 * M_PI)) * sector_bins_)) % sector_bins_;
+        if (bin < 0) bin += sector_bins_;
+        hist[bin]++;
+      }
+      int max_idx = 0, second_idx = -1; int max_val = hist[0];
+      for (int i = 1; i < sector_bins_; ++i) {
+        if (hist[i] > max_val) { second_idx = max_idx; max_idx = i; max_val = hist[i]; }
+        else if (second_idx < 0 || hist[i] > hist[second_idx]) { second_idx = i; }
+      }
+      double frac = static_cast<double>(max_val) / static_cast<double>(pts_sector.size());
+      if (frac >= sector_peak_thresh_) {
+        double mean_dist = 0.0; int cnt = 0;
+        double ang_low = (static_cast<double>(max_idx) / sector_bins_) * 2.0 * M_PI;
+        double ang_high = (static_cast<double>(max_idx + 1) / sector_bins_) * 2.0 * M_PI;
+        for (const auto &pp : pts_sector) {
+          double ang = std::atan2(pp.second, pp.first);
+          if (ang < 0) ang += 2.0 * M_PI;
+          double a = ang;
+          if (a >= ang_low && a < ang_high) { mean_dist += std::sqrt(pp.first*pp.first + pp.second*pp.second); ++cnt; }
+        }
+        if (cnt > 0) mean_dist /= static_cast<double>(cnt); else mean_dist = sector_radius_;
+        double wall_pen = wall_penalty_weight_ * std::exp(-mean_dist / (0.5 * sector_radius_));
+        penalty += wall_pen;
+        if (second_idx >= 0 && hist[second_idx] > 0) {
+          double frac2 = static_cast<double>(hist[second_idx]) / static_cast<double>(pts_sector.size());
+          int diff = std::abs(max_idx - second_idx);
+          if (diff > sector_bins_/4 && (frac2 >= (sector_peak_thresh_ * 0.6))) {
+            penalty += corner_penalty_weight_;
+            graph_penalized_nodes_.insert(nid);
+          }
+        }
+      }
+    }
+
+    graph_node_penalty_[nid] = penalty;
+    if (penalty > 1e-9) graph_penalized_nodes_.insert(nid);
+  }
+
 }
 
 void AstarOctoPlanner::publishGraphMarkers()

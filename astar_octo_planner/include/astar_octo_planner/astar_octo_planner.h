@@ -44,6 +44,7 @@
 #include <octomap_msgs/msg/octomap.hpp>
 #include <octomap/OcTree.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <mbf_octo_core/octo_planner.h>
 #include <mbf_msgs/action/get_path.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -297,6 +298,12 @@ private:
   // Graph containers (id -> node, id -> neighbours)
   std::unordered_map<std::string, GraphNode> graph_nodes_;
   std::unordered_map<std::string, std::vector<std::string>> graph_adj_;
+
+  // Cached per-graph penalties (computed when the graph is built). These are
+  // filled in buildConnectivityGraph() and copied into per-plan locals in
+  // makePlan() to avoid expensive repeated detection during A*.
+  std::unordered_map<std::string, double> graph_node_penalty_;
+  std::unordered_set<std::string> graph_penalized_nodes_;
 
   // Background graph builder members
   std::mutex graph_mutex_;
