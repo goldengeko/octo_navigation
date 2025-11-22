@@ -49,6 +49,8 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <thread>
+#include <atomic>
 #include <chrono>
 
 PLUGINLIB_EXPORT_CLASS(astar_octo_planner::AstarOctoPlanner, mbf_octo_core::OctoPlanner);
@@ -444,8 +446,6 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
   graph_adj_.clear();
   if (!octree_) return;
 
-  unsigned int maxDepth = octree_->getTreeDepth();
-
   // First pass: collect candidate free leaf nodes (use leaf iterator available in this OctoMap build)
   size_t total_leafs = 0;
   size_t free_leafs = 0;
@@ -455,8 +455,8 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
   size_t skipped_no_surface = 0;
   size_t skipped_step_too_high = 0;
   size_t inserted = 0;
-  size_t rejected_distance = 0;
-  size_t rejected_los = 0;
+  std::atomic<size_t> rejected_distance{0};
+  std::atomic<size_t> rejected_los{0};
 
   //Build surface graph from occupied leafs (top face of occupied voxels)
   for (auto it = octree_->begin_leafs(), end = octree_->end_leafs(); it != end; ++it) {
@@ -508,7 +508,12 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
   // RCLCPP_INFO(node_->get_logger(), "Graph build extra: skipped_no_surface=%zu", skipped_no_surface);
   // RCLCPP_INFO(node_->get_logger(), "Graph build extra: skipped_step_too_high=%zu", skipped_step_too_high);
 
-  // Second pass: sampling-based neighbour detection (26 directions)
+  std::vector<std::pair<std::string, GraphNode>> node_snapshot;
+  node_snapshot.reserve(graph_nodes_.size());
+  for (const auto &kv : graph_nodes_) {
+    node_snapshot.emplace_back(kv.first, kv.second);
+  }
+
   const std::vector<octomap::point3d> dirs = [](){
     std::vector<octomap::point3d> d;
     for (int dx=-1; dx<=1; ++dx) for (int dy=-1; dy<=1; ++dy) for (int dz=-1; dz<=1; ++dz) {
@@ -518,87 +523,99 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
     return d;
   }();
 
-  for (const auto &kv : graph_nodes_) {
-    const std::string id = kv.first;
-    const GraphNode &node = kv.second;
-    double node_size = node.size;
-    for (const auto &dir : dirs) {
-      octomap::point3d sample = node.center + dir * (node_size * 0.5 + eps);
-      // bounds check using min/max bounds
-      if (sample.x() < min_bound_[0] - node_size || sample.x() > max_bound_[0] + node_size ||
-          sample.y() < min_bound_[1] - node_size || sample.y() > max_bound_[1] + node_size ||
-          sample.z() < min_bound_[2] - node_size || sample.z() > max_bound_[2] + node_size) {
-        continue;
-      }
-      octomap::OcTreeNode* found = octree_->search(sample.x(), sample.y(), sample.z());
-      if (!found) continue;
-      // get key for found node
-      octomap::OcTreeKey fkey = octree_->coordToKey(sample);
-      // build id
-      // depth determination: try to find matching depth by probing sizes (approx)
-      unsigned int fdepth = maxDepth;
-      // Find a matching node in our graph by key prefix
-      std::string found_id;
-      for (unsigned int d = 0; d <= maxDepth; ++d) {
-        octomap::OcTreeKey k = fkey;
-        // try to adjust? we'll use full key and assume graph contains the exact key
-      }
-      // naive: search graph_nodes_ by comparing centers (slow but fine for prototype)
-      octomap::point3d found_center = octree_->keyToCoord(fkey);
-      double best_dist = std::numeric_limits<double>::infinity();
-      std::string best_id;
-      for (const auto &kv2 : graph_nodes_) {
-        double dx = kv2.second.center.x() - found_center.x();
-        double dy = kv2.second.center.y() - found_center.y();
-        double dz = kv2.second.center.z() - found_center.z();
-        double dsq = dx*dx + dy*dy + dz*dz;
-        if (dsq < best_dist) { best_dist = dsq; best_id = kv2.first; }
-      }
-      if (!best_id.empty()) {
-        // accept neighbour if size of neighbor >= this node size (equal or larger)
-        if (graph_nodes_[best_id].size + 1e-9 >= node_size) {
-          // ensure the matched center is not too far (avoid matching distant nodes through obstacles)
-          double best_dist_sq = best_dist;
-          double thresh = node_size * 1.5; // allow a bit more than one node size
-          if (best_dist_sq > thresh * thresh) {
-            ++rejected_distance;
-            continue;
-          }
-          // line-of-sight check: ensure straight segment between centers does not hit an occupied voxel
-          const octomap::point3d &a = node.center;
-          const octomap::point3d &b = graph_nodes_.at(best_id).center;
-          octomap::point3d dir = b - a;
-          double dist = dir.norm();
-          if (dist > 1e-9) {
-            dir /= dist; // normalize
-            bool hit = false;
-            // safe fallback: sample along segment in steps of ~voxel size and check occupancy via search()
-            // (we avoid octree::castRay entirely to prevent 'hit bounds' warnings)
-            double step_size = std::max(active_voxel_size_, 0.05);
-            int steps = std::max(1, static_cast<int>(std::ceil(dist / step_size)));
-            // sample from 1 .. steps-1 to avoid checking the destination center (which should be free)
-            for (int si = 1; si < steps; ++si) {
-              double t = static_cast<double>(si) / static_cast<double>(steps);
-              octomap::point3d s = a + dir * (dist * t);
-              // skip samples outside bounds
-              const double eps = 1e-6;
-              if (s.x() < min_bound_[0] - eps || s.x() > max_bound_[0] + eps ||
-                  s.y() < min_bound_[1] - eps || s.y() > max_bound_[1] + eps ||
-                  s.z() < min_bound_[2] - eps || s.z() > max_bound_[2] + eps) continue;
-              octomap::OcTreeNode* nn = octree_->search(s.x(), s.y(), s.z());
-              if (nn && octree_->isNodeOccupied(nn)) { hit = true; break; }
-            }
-            if (hit) {
-              ++rejected_los;
-              continue;
-            }
-          }
-          // finally accept neighbour
-          auto &vec = graph_adj_[id];
-          // avoid duplicates
-          if (std::find(vec.begin(), vec.end(), best_id) == vec.end()) vec.push_back(best_id);
+  std::vector<std::vector<std::string>> adjacency(node_snapshot.size());
+
+  auto neighbor_worker = [&](size_t start, size_t end) {
+    for (size_t idx = start; idx < end; ++idx) {
+      const auto &id = node_snapshot[idx].first;
+      const GraphNode &node = node_snapshot[idx].second;
+      auto &vec = adjacency[idx];
+      double node_size = node.size;
+      for (const auto &dir : dirs) {
+        octomap::point3d sample = node.center + dir * (node_size * 0.5 + eps);
+        if (sample.x() < min_bound_[0] - node_size || sample.x() > max_bound_[0] + node_size ||
+            sample.y() < min_bound_[1] - node_size || sample.y() > max_bound_[1] + node_size ||
+            sample.z() < min_bound_[2] - node_size || sample.z() > max_bound_[2] + node_size) {
+          continue;
         }
+  octomap::OcTreeNode* found = octree_->search(sample.x(), sample.y(), sample.z());
+  if (!found) continue;
+  octomap::OcTreeKey fkey = octree_->coordToKey(sample);
+        octomap::point3d found_center = octree_->keyToCoord(fkey);
+        double best_dist = std::numeric_limits<double>::infinity();
+        size_t best_idx = node_snapshot.size();
+        for (size_t j = 0; j < node_snapshot.size(); ++j) {
+          const auto &cand = node_snapshot[j].second;
+          double dx = cand.center.x() - found_center.x();
+          double dy = cand.center.y() - found_center.y();
+          double dz = cand.center.z() - found_center.z();
+          double dsq = dx*dx + dy*dy + dz*dz;
+          if (dsq < best_dist) { best_dist = dsq; best_idx = j; }
+        }
+        if (best_idx == node_snapshot.size()) continue;
+        const auto &best_id = node_snapshot[best_idx].first;
+        const auto &best_node = node_snapshot[best_idx].second;
+        if (best_node.size + 1e-9 < node_size) continue;
+        double thresh = node_size * 1.5;
+        if (best_dist > thresh * thresh) {
+          ++rejected_distance;
+          continue;
+        }
+        const octomap::point3d &a = node.center;
+        const octomap::point3d &b = best_node.center;
+        octomap::point3d dir_line = b - a;
+        double dist = dir_line.norm();
+        bool hit = false;
+        if (dist > 1e-9) {
+          dir_line /= dist;
+          double step_size = std::max(active_voxel_size_, 0.05);
+          int steps = std::max(1, static_cast<int>(std::ceil(dist / step_size)));
+          for (int si = 1; si < steps; ++si) {
+            double t = static_cast<double>(si) / static_cast<double>(steps);
+            octomap::point3d s = a + dir_line * (dist * t);
+            const double eps_bounds = 1e-6;
+            if (s.x() < min_bound_[0] - eps_bounds || s.x() > max_bound_[0] + eps_bounds ||
+                s.y() < min_bound_[1] - eps_bounds || s.y() > max_bound_[1] + eps_bounds ||
+                s.z() < min_bound_[2] - eps_bounds || s.z() > max_bound_[2] + eps_bounds) continue;
+            octomap::OcTreeNode* nn = octree_->search(s.x(), s.y(), s.z());
+            if (nn && octree_->isNodeOccupied(nn)) { hit = true; break; }
+          }
+        }
+        if (hit) {
+          ++rejected_los;
+          continue;
+        }
+        if (std::find(vec.begin(), vec.end(), best_id) == vec.end()) vec.push_back(best_id);
       }
+    }
+  };
+
+  if (!node_snapshot.empty()) {
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 2;
+    const size_t min_batch = 128;
+    unsigned int num_threads = node_snapshot.size() < min_batch ? 1U : hw;
+    num_threads = std::max(1U, std::min(num_threads, static_cast<unsigned int>(node_snapshot.size())));
+    if (num_threads == 1) {
+      neighbor_worker(0, node_snapshot.size());
+    } else {
+      size_t chunk = (node_snapshot.size() + num_threads - 1) / num_threads;
+      std::vector<std::thread> threads;
+      threads.reserve(num_threads);
+      for (unsigned int t = 0; t < num_threads; ++t) {
+        size_t start = t * chunk;
+        if (start >= node_snapshot.size()) break;
+        size_t end = std::min(start + chunk, node_snapshot.size());
+        threads.emplace_back(neighbor_worker, start, end);
+      }
+      for (auto &th : threads) {
+        if (th.joinable()) th.join();
+      }
+    }
+
+    graph_adj_.clear();
+    for (size_t idx = 0; idx < node_snapshot.size(); ++idx) {
+      graph_adj_[node_snapshot[idx].first] = std::move(adjacency[idx]);
     }
   }
 
@@ -653,109 +670,109 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
   // base penalties here (no spread/inflation)
   graph_node_penalty_.clear();
   graph_penalized_nodes_.clear();
-  // Compute base penalties using the same detectors as used during planning
-  auto t_pen_start = std::chrono::steady_clock::now();
-  for (const auto &kv : graph_nodes_) {
-    const std::string nid = kv.first;
-    const GraphNode &n = kv.second;
-    double penalty = 0.0;
 
-    // centroid-shift detector (k-nearest variant)
-    std::vector<octomap::point3d> nbrs;
-    for (const auto &kv2 : graph_nodes_) {
-      if (kv2.first == nid) continue;
-      double dx = kv2.second.center.x() - n.center.x();
-      double dy = kv2.second.center.y() - n.center.y();
-      double dxy = std::sqrt(dx*dx + dy*dy);
-      if (dxy <= ransac_radius_) nbrs.push_back(kv2.second.center);
-    }
-    if (nbrs.size() >= 4) {
-      std::sort(nbrs.begin(), nbrs.end(), [&](const octomap::point3d &a, const octomap::point3d &b){
-        double da = std::hypot(a.x()-n.center.x(), a.y()-n.center.y());
-        double db = std::hypot(b.x()-n.center.x(), b.y()-n.center.y());
-        return da < db;
-      });
-      size_t k_use = std::min(static_cast<size_t>(centroid_k_), nbrs.size());
-      double cx=0, cy=0, cz=0;
-      for (size_t ii=0; ii<k_use; ++ii) { cx += nbrs[ii].x(); cy += nbrs[ii].y(); cz += nbrs[ii].z(); }
-      cx /= static_cast<double>(k_use); cy /= static_cast<double>(k_use); cz /= static_cast<double>(k_use);
-      double shift = std::sqrt((cx - n.center.x())*(cx - n.center.x()) + (cy - n.center.y())*(cy - n.center.y()) + (cz - n.center.z())*(cz - n.center.z()));
-      double Zi = 1e9; for (size_t ii=0; ii<k_use; ++ii) {
-        double dd = std::sqrt((nbrs[ii].x()-n.center.x())*(nbrs[ii].x()-n.center.x()) + (nbrs[ii].y()-n.center.y())*(nbrs[ii].y()-n.center.y()) + (nbrs[ii].z()-n.center.z())*(nbrs[ii].z()-n.center.z()));
-        Zi = std::min(Zi, dd);
+  if (node_snapshot.empty()) {
+    RCLCPP_INFO(node_->get_logger(), "Penalty computation skipped (no nodes)");
+  } else {
+    auto t_pen_start = std::chrono::steady_clock::now();
+
+    std::vector<double> penalties(node_snapshot.size(), 0.0);
+    std::vector<bool> penalized(node_snapshot.size(), false);
+
+    auto compute_penalty = [&](size_t idx) {
+      const auto &nid = node_snapshot[idx].first;
+      const auto &n = node_snapshot[idx].second;
+      double penalty = 0.0;
+
+      // centroid-shift detector (k-nearest variant)
+      std::vector<octomap::point3d> nbrs;
+      nbrs.reserve(32);
+      for (size_t j = 0; j < node_snapshot.size(); ++j) {
+        if (j == idx) continue;
+        const auto &nj = node_snapshot[j].second;
+        double dx = nj.center.x() - n.center.x();
+        double dy = nj.center.y() - n.center.y();
+        double dxy = std::sqrt(dx*dx + dy*dy);
+        if (dxy <= ransac_radius_) nbrs.push_back(nj.center);
       }
-      if (Zi < 1e-6) Zi = n.size;
-      if (shift > centroid_lambda_ * Zi) {
-        penalty += centroid_penalty_weight_;
-        graph_penalized_nodes_.insert(nid);
-      } else {
-        double minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,minz=1e9,maxz=-1e9;
-        for (size_t ii=0; ii<k_use; ++ii) {
-          double vx = nbrs[ii].x(); double vy = nbrs[ii].y(); double vz = nbrs[ii].z();
-          if (vx < minx) minx = vx; if (vx > maxx) maxx = vx;
-          if (vy < miny) miny = vy; if (vy > maxy) maxy = vy;
-          if (vz < minz) minz = vz; if (vz > maxz) maxz = vz;
+      if (nbrs.size() >= 4) {
+        std::sort(nbrs.begin(), nbrs.end(), [&](const octomap::point3d &a, const octomap::point3d &b){
+          double da = std::hypot(a.x()-n.center.x(), a.y()-n.center.y());
+          double db = std::hypot(b.x()-n.center.x(), b.y()-n.center.y());
+          return da < db;
+        });
+        size_t k_use = std::min(static_cast<size_t>(centroid_k_), nbrs.size());
+        double cx=0, cy=0, cz=0;
+        for (size_t ii=0; ii<k_use; ++ii) { cx += nbrs[ii].x(); cy += nbrs[ii].y(); cz += nbrs[ii].z(); }
+        cx /= static_cast<double>(k_use); cy /= static_cast<double>(k_use); cz /= static_cast<double>(k_use);
+        double shift = std::sqrt((cx - n.center.x())*(cx - n.center.x()) + (cy - n.center.y())*(cy - n.center.y()) + (cz - n.center.z())*(cz - n.center.z()));
+        double Zi = 1e9; for (size_t ii=0; ii<k_use; ++ii) {
+          double dd = std::sqrt((nbrs[ii].x()-n.center.x())*(nbrs[ii].x()-n.center.x()) + (nbrs[ii].y()-n.center.y())*(nbrs[ii].y()-n.center.y()) + (nbrs[ii].z()-n.center.z())*(nbrs[ii].z()-n.center.z()));
+          Zi = std::min(Zi, dd);
         }
-        int axes = 0; double rho = 0.05;
-        if ((maxx - minx) > rho) ++axes; if ((maxy - miny) > rho) ++axes; if ((maxz - minz) > rho) ++axes;
-        if (axes >= 2) { penalty += 0.5 * centroid_penalty_weight_; graph_penalized_nodes_.insert(nid); }
+        if (Zi < 1e-6) Zi = n.size;
+        if (shift > centroid_lambda_ * Zi) {
+          penalty += centroid_penalty_weight_;
+        } else {
+          double minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,minz=1e9,maxz=-1e9;
+          for (size_t ii=0; ii<k_use; ++ii) {
+            double vx = nbrs[ii].x(); double vy = nbrs[ii].y(); double vz = nbrs[ii].z();
+            if (vx < minx) minx = vx; if (vx > maxx) maxx = vx;
+            if (vy < miny) miny = vy; if (vy > maxy) maxy = vy;
+            if (vz < minz) minz = vz; if (vz > maxz) maxz = vz;
+          }
+          int axes = 0; double rho = 0.05;
+          if ((maxx - minx) > rho) ++axes; if ((maxy - miny) > rho) ++axes; if ((maxz - minz) > rho) ++axes;
+          if (axes >= 2) { penalty += 0.5 * centroid_penalty_weight_; }
+        }
+      }
+
+      penalties[idx] = penalty;
+      penalized[idx] = penalty > 1e-9;
+    };
+
+    auto worker = [&](size_t start, size_t end) {
+      for (size_t idx = start; idx < end; ++idx) {
+        compute_penalty(idx);
+      }
+    };
+
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 2;
+    const size_t min_batch = 128;
+    unsigned int num_threads = node_snapshot.size() < min_batch ? 1U : hw;
+    num_threads = std::max(1U, std::min(num_threads, static_cast<unsigned int>(node_snapshot.size())));
+
+    if (num_threads == 1) {
+      worker(0, node_snapshot.size());
+    } else {
+      size_t chunk = (node_snapshot.size() + num_threads - 1) / num_threads;
+      std::vector<std::thread> threads;
+      threads.reserve(num_threads);
+      for (unsigned int t = 0; t < num_threads; ++t) {
+        size_t start = t * chunk;
+        if (start >= node_snapshot.size()) break;
+        size_t end = std::min(start + chunk, node_snapshot.size());
+        threads.emplace_back(worker, start, end);
+      }
+      for (auto &th : threads) {
+        if (th.joinable()) th.join();
       }
     }
 
-    // sector-histogram detector (fast) temporarily disabled to benchmark centroid detector
-    // std::vector<std::pair<double,double>> pts_sector;
-    // for (const auto &kv2 : graph_nodes_) {
-    //   if (kv2.first == nid) continue;
-    //   double dx = kv2.second.center.x() - n.center.x();
-    //   double dy = kv2.second.center.y() - n.center.y();
-    //   double dxy = std::sqrt(dx*dx + dy*dy);
-    //   if (dxy <= sector_radius_) pts_sector.emplace_back(dx, dy);
-    // }
-    // if (pts_sector.size() >= static_cast<size_t>(sector_min_inliers_)) {
-    //   std::vector<int> hist(sector_bins_, 0);
-    //   for (const auto &pp : pts_sector) {
-    //     double ang = std::atan2(pp.second, pp.first);
-    //     if (ang < 0) ang += 2.0 * M_PI;
-    //     int bin = static_cast<int>(std::floor((ang / (2.0 * M_PI)) * sector_bins_)) % sector_bins_;
-    //     if (bin < 0) bin += sector_bins_;
-    //     hist[bin]++;
-    //   }
-    //   int max_idx = 0, second_idx = -1; int max_val = hist[0];
-    //   for (int i = 1; i < sector_bins_; ++i) {
-    //     if (hist[i] > max_val) { second_idx = max_idx; max_idx = i; max_val = hist[i]; }
-    //     else if (second_idx < 0 || hist[i] > hist[second_idx]) { second_idx = i; }
-    //   }
-    //   double frac = static_cast<double>(max_val) / static_cast<double>(pts_sector.size());
-    //   if (frac >= sector_peak_thresh_) {
-    //     double mean_dist = 0.0; int cnt = 0;
-    //     double ang_low = (static_cast<double>(max_idx) / sector_bins_) * 2.0 * M_PI;
-    //     double ang_high = (static_cast<double>(max_idx + 1) / sector_bins_) * 2.0 * M_PI;
-    //     for (const auto &pp : pts_sector) {
-    //       double ang = std::atan2(pp.second, pp.first);
-    //       if (ang < 0) ang += 2.0 * M_PI;
-    //       double a = ang;
-    //       if (a >= ang_low && a < ang_high) { mean_dist += std::sqrt(pp.first*pp.first + pp.second*pp.second); ++cnt; }
-    //     }
-    //     if (cnt > 0) mean_dist /= static_cast<double>(cnt); else mean_dist = sector_radius_;
-    //     double wall_pen = wall_penalty_weight_ * std::exp(-mean_dist / (0.5 * sector_radius_));
-    //     penalty += wall_pen;
-    //     if (second_idx >= 0 && hist[second_idx] > 0) {
-    //       double frac2 = static_cast<double>(hist[second_idx]) / static_cast<double>(pts_sector.size());
-    //       int diff = std::abs(max_idx - second_idx);
-    //       if (diff > sector_bins_/4 && (frac2 >= (sector_peak_thresh_ * 0.6))) {
-    //         penalty += corner_penalty_weight_;
-    //         graph_penalized_nodes_.insert(nid);
-    //       }
-    //     }
-    //   }
-    // }
+    for (size_t idx = 0; idx < node_snapshot.size(); ++idx) {
+      const auto &nid = node_snapshot[idx].first;
+      double penalty = penalties[idx];
+      graph_node_penalty_[nid] = penalty;
+      if (penalized[idx]) {
+        graph_penalized_nodes_.insert(nid);
+      }
+    }
 
-    graph_node_penalty_[nid] = penalty;
-    if (penalty > 1e-9) graph_penalized_nodes_.insert(nid);
+    auto t_pen_end = std::chrono::steady_clock::now();
+    double dur_pen = std::chrono::duration_cast<std::chrono::duration<double>>(t_pen_end - t_pen_start).count();
+    RCLCPP_INFO(node_->get_logger(), "Penalty computation took %.3f s using %u thread(s)", dur_pen, std::max(1U, num_threads));
   }
-  auto t_pen_end = std::chrono::steady_clock::now();
-  double dur_pen = std::chrono::duration_cast<std::chrono::duration<double>>(t_pen_end - t_pen_start).count();
-  RCLCPP_INFO(node_->get_logger(), "Penalty computation took %.3f s", dur_pen);
 
   auto t_graph_end = std::chrono::steady_clock::now();
   double dur_graph_total = std::chrono::duration_cast<std::chrono::duration<double>>(t_graph_end - t_graph_start).count();
