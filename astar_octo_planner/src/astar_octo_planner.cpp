@@ -619,6 +619,25 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
     }
   }
 
+  std::unordered_map<std::string, size_t> node_index;
+  node_index.reserve(node_snapshot.size());
+  for (size_t idx = 0; idx < node_snapshot.size(); ++idx) {
+    node_index[node_snapshot[idx].first] = idx;
+  }
+
+  std::vector<std::vector<size_t>> neighbor_indices(node_snapshot.size());
+  for (size_t idx = 0; idx < node_snapshot.size(); ++idx) {
+    const auto &id = node_snapshot[idx].first;
+    auto adj_it = graph_adj_.find(id);
+    if (adj_it == graph_adj_.end()) continue;
+    auto &dest = neighbor_indices[idx];
+    dest.reserve(adj_it->second.size());
+    for (const auto &nb_id : adj_it->second) {
+      auto it_idx = node_index.find(nb_id);
+      if (it_idx != node_index.end()) dest.push_back(it_idx->second);
+    }
+  }
+
   // After building all adjacency, emit a compact diagnostic summary and check ranges
   if (!graph_nodes_.empty()) {
     double min_cx = std::numeric_limits<double>::infinity();
@@ -676,13 +695,15 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
   } else {
     auto t_pen_start = std::chrono::steady_clock::now();
 
-    std::vector<double> penalties(node_snapshot.size(), 0.0);
-    std::vector<bool> penalized(node_snapshot.size(), false);
+  std::vector<double> penalties(node_snapshot.size(), 0.0);
+  std::vector<bool> penalized(node_snapshot.size(), false);
+  std::vector<bool> spread_sources(node_snapshot.size(), false);
 
     auto compute_penalty = [&](size_t idx) {
-      const auto &nid = node_snapshot[idx].first;
-      const auto &n = node_snapshot[idx].second;
-      double penalty = 0.0;
+  const auto &nid = node_snapshot[idx].first;
+  const auto &n = node_snapshot[idx].second;
+  double penalty = 0.0;
+  bool corner_like = false;
 
       // centroid-shift detector (k-nearest variant)
       std::vector<octomap::point3d> nbrs;
@@ -712,7 +733,8 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
         }
         if (Zi < 1e-6) Zi = n.size;
         if (shift > centroid_lambda_ * Zi) {
-          penalty += centroid_penalty_weight_;
+          penalty += std::max(0.0, corner_penalty_weight_);
+          corner_like = true;
         } else {
           double minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,minz=1e9,maxz=-1e9;
           for (size_t ii=0; ii<k_use; ++ii) {
@@ -729,6 +751,7 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
 
       penalties[idx] = penalty;
       penalized[idx] = penalty > 1e-9;
+      if (corner_like) spread_sources[idx] = true;
     };
 
     auto worker = [&](size_t start, size_t end) {
@@ -757,6 +780,28 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
       }
       for (auto &th : threads) {
         if (th.joinable()) th.join();
+      }
+    }
+    //  Apply penalty spread from corner-like nodes to their neighbors
+    if (penalty_spread_radius_ > 1e-6 && penalty_spread_factor_ > 1e-6) {
+      const double max_radius = penalty_spread_radius_;
+      for (size_t src = 0; src < node_snapshot.size(); ++src) {
+        double base_pen = penalties[src];
+        if (base_pen <= 1e-9) continue;
+        if (!spread_sources[src]) continue;
+        for (size_t nb_idx : neighbor_indices[src]) {
+          const auto &a = node_snapshot[src].second.center;
+          const auto &b = node_snapshot[nb_idx].second.center;
+          double dist = a.distance(b);
+          if (!std::isfinite(dist)) continue;
+          if (dist > max_radius) continue;
+          double atten = 1.0 - (dist / max_radius);
+          if (atten < 0.0) atten = 0.0;
+          double addition = base_pen * penalty_spread_factor_ * atten;
+          if (addition <= 0.0) continue;
+          penalties[nb_idx] += addition;
+          penalized[nb_idx] = true;
+        }
       }
     }
 
@@ -1021,7 +1066,7 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   max_step_height_ = node_->declare_parameter(name_ + ".max_step_height", max_step_height_);
   // corner/edge penalty parameters
   corner_radius_ = node_->declare_parameter(name_ + ".corner_radius", 0.40);
-  corner_penalty_weight_ = node_->declare_parameter(name_ + ".corner_penalty_weight", 3.0);
+  corner_penalty_weight_ = node_->declare_parameter(name_ + ".corner_penalty_weight", corner_penalty_weight_);
   // Sector-histogram detector parameters (for directional wall/corner detection)
   sector_bins_ = node_->declare_parameter(name_ + ".sector_bins", sector_bins_);
   sector_radius_ = node_->declare_parameter(name_ + ".sector_radius", sector_radius_);

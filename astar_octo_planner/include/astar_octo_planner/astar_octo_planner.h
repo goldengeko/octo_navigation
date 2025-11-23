@@ -270,8 +270,8 @@ private:
   double centroid_penalty_weight_ = 2.0;// penalty weight applied when centroid shift indicates edge
 
   // Penalty spread
-  double penalty_spread_radius_ = 0.0; // meters, radius within which to spread a fraction of the penalty
-  double penalty_spread_factor_ = 0.0; // fraction [0..1] of the penalty to distribute among neighbors
+  double penalty_spread_radius_ = 4.5; // meters, radius within which to spread a fraction of the penalty
+  double penalty_spread_factor_ = 1.0; // fraction [0..1] of the penalty to distribute among neighbors
 
   // Hash function for tuple<int, int, int> to track unique occupied voxels
   struct TupleHash {
