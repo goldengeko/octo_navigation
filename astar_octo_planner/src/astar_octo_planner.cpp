@@ -514,6 +514,21 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
     node_snapshot.emplace_back(kv.first, kv.second);
   }
 
+  const size_t min_batch = 128;
+  auto pick_thread_count = [&](size_t workload) -> unsigned int {
+    if (workload == 0) return 0U;
+    if (workload < min_batch) return 1U;
+    unsigned int cap = 0U;
+    if (worker_thread_limit_ > 0) {
+      cap = static_cast<unsigned int>(worker_thread_limit_);
+    } else {
+      cap = std::thread::hardware_concurrency();
+      if (cap == 0U) cap = 2U;
+    }
+    cap = std::max(1U, cap);
+    return std::max(1U, std::min(cap, static_cast<unsigned int>(workload)));
+  };
+
   const std::vector<octomap::point3d> dirs = [](){
     std::vector<octomap::point3d> d;
     for (int dx=-1; dx<=1; ++dx) for (int dy=-1; dy<=1; ++dy) for (int dz=-1; dz<=1; ++dz) {
@@ -591,11 +606,8 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
   };
 
   if (!node_snapshot.empty()) {
-    unsigned int hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 2;
-    const size_t min_batch = 128;
-    unsigned int num_threads = node_snapshot.size() < min_batch ? 1U : hw;
-    num_threads = std::max(1U, std::min(num_threads, static_cast<unsigned int>(node_snapshot.size())));
+    unsigned int num_threads = pick_thread_count(node_snapshot.size());
+    if (num_threads == 0) num_threads = 1;
     if (num_threads == 1) {
       neighbor_worker(0, node_snapshot.size());
     } else {
@@ -760,11 +772,8 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
       }
     };
 
-    unsigned int hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 2;
-    const size_t min_batch = 128;
-    unsigned int num_threads = node_snapshot.size() < min_batch ? 1U : hw;
-    num_threads = std::max(1U, std::min(num_threads, static_cast<unsigned int>(node_snapshot.size())));
+    unsigned int num_threads = pick_thread_count(node_snapshot.size());
+    if (num_threads == 0) num_threads = 1;
 
     if (num_threads == 1) {
       worker(0, node_snapshot.size());
@@ -1079,6 +1088,7 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   // Penalty spread parameters (spread detected penalties to neighbors)
   penalty_spread_radius_ = node_->declare_parameter(name_ + ".penalty_spread_radius", penalty_spread_radius_);
   penalty_spread_factor_ = node_->declare_parameter(name_ + ".penalty_spread_factor", penalty_spread_factor_);
+  worker_thread_limit_ = node_->declare_parameter(name_ + ".worker_thread_limit", worker_thread_limit_);
 
 
   // Graph marker publishing (for RViz visualization of node centers)
@@ -1311,6 +1321,14 @@ rcl_interfaces::msg::SetParametersResult AstarOctoPlanner::reconfigureCallback(s
     } else if (parameter.get_name() == name_ + ".penalty_spread_factor") {
       penalty_spread_factor_ = parameter.as_double();
       RCLCPP_INFO_STREAM(node_->get_logger(), "Updated penalty_spread_factor to " << penalty_spread_factor_);
+    } else if (parameter.get_name() == name_ + ".worker_thread_limit") {
+      int new_limit = parameter.as_int();
+      if (new_limit < 0) {
+        RCLCPP_WARN(node_->get_logger(), "worker_thread_limit cannot be negative (requested %d). Keeping %d.", new_limit, worker_thread_limit_);
+      } else {
+        worker_thread_limit_ = new_limit;
+        RCLCPP_INFO(node_->get_logger(), "Updated worker_thread_limit to %d", worker_thread_limit_);
+      }
     }
   }
   result.successful = true;
