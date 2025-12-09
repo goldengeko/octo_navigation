@@ -12,6 +12,12 @@
   <buildtool_depend>ament_cmake_python</buildtool_depend>
   <depend>rclcpp</depend>
   <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>octomap_msgs</depend>
+  <depend>octomap</depend>
+  <depend>visualization_msgs</depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
   <depend>mbf_octo_core</depend>
   <depend>mbf_msgs</depend>
