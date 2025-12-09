@@ -5,10 +5,18 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QDoubleSpinBox>
 #include <QTimer>
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <mbf_msgs/action/get_path.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 namespace alert_nav_plugins
 {
@@ -28,12 +36,15 @@ private Q_SLOTS:
   void onToggleOctomap();
   void onFactorChanged(double v);
   void onRadiusChanged(double v);
+  void onPlanToFrame();
   void updateButtonUI(bool enabled);
 
 private:
   QPushButton* toggle_btn_ = nullptr;
+  QPushButton* plan_btn_ = nullptr;
   QDoubleSpinBox* factor_spin_ = nullptr;
   QDoubleSpinBox* radius_spin_ = nullptr;
+  QLineEdit* frame_input_ = nullptr;
 
   // rclcpp node and parameter client
   // rclcpp node and parameter client
@@ -48,6 +59,13 @@ private:
   QTimer* spin_timer_ = nullptr;
   // true if this panel called rclcpp::init()
   bool we_initialized_rclcpp_ = false;
+
+  using GetPath = mbf_msgs::action::GetPath;
+  rclcpp_action::Client<GetPath>::SharedPtr get_path_client_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::string map_frame_ = "map";
+  std::string get_path_action_name_ = "/move_base_flex/get_path";
 };
 
 } // namespace alert_nav_plugins

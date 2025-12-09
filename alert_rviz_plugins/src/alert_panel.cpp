@@ -1,6 +1,7 @@
 #include "alert_nav_plugins/alert_panel.hpp"
 #include <rviz_common/config.hpp>
 #include <pluginlib/class_list_macros.hpp>
+#include <tf2/exceptions.h>
 
 namespace alert_nav_plugins
 {
@@ -34,6 +35,16 @@ AlertPanel::AlertPanel(QWidget* parent)
   connect(radius_spin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &AlertPanel::onRadiusChanged);
   v->addLayout(h2);
 
+  auto h3 = new QHBoxLayout();
+  h3->addWidget(new QLabel("Target frame"));
+  frame_input_ = new QLineEdit();
+  frame_input_->setPlaceholderText("e.g. Linear_Inspect_KRail");
+  h3->addWidget(frame_input_);
+  plan_btn_ = new QPushButton("Plan path");
+  h3->addWidget(plan_btn_);
+  connect(plan_btn_, &QPushButton::clicked, this, &AlertPanel::onPlanToFrame);
+  v->addLayout(h3);
+
   setLayout(v);
 
   // create rcl node for parameter updates
@@ -46,6 +57,9 @@ AlertPanel::AlertPanel(QWidget* parent)
   }
   rcl_node_ = std::make_shared<rclcpp::Node>("alert_nav_rvizpanel_node");
   param_client_ = std::make_shared<rclcpp::AsyncParametersClient>(rcl_node_, param_node_name_);
+  tf_buffer_ = std::make_unique<tf2_ros::Buffer>(rcl_node_->get_clock());
+  tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, rcl_node_, false);
+  get_path_client_ = rclcpp_action::create_client<GetPath>(rcl_node_, get_path_action_name_);
 
   // Log so we can see in the rviz terminal that the panel was constructed
   try {
@@ -117,6 +131,99 @@ void AlertPanel::onRadiusChanged(double v)
   std::vector<rclcpp::Parameter> params;
   params.emplace_back(planner_node_name_ + ".penalty_spread_radius", v);
   param_client_->set_parameters(params);
+}
+
+void AlertPanel::onPlanToFrame()
+{
+  if (!frame_input_ || !rcl_node_)
+  {
+    return;
+  }
+
+  const auto frame_name = frame_input_->text().trimmed().toStdString();
+  if (frame_name.empty())
+  {
+    RCLCPP_WARN(rcl_node_->get_logger(), "No target frame provided for GetPath request");
+    return;
+  }
+
+  if (!tf_buffer_)
+  {
+    RCLCPP_ERROR(rcl_node_->get_logger(), "TF buffer not initialized");
+    return;
+  }
+
+  geometry_msgs::msg::TransformStamped tf_map_target;
+  try
+  {
+    tf_map_target = tf_buffer_->lookupTransform(map_frame_, frame_name, tf2::TimePointZero);
+  }
+  catch (const tf2::TransformException &ex)
+  {
+    RCLCPP_WARN(
+      rcl_node_->get_logger(),
+      "Failed to lookup transform map->%s: %s",
+      frame_name.c_str(),
+      ex.what());
+    return;
+  }
+
+  geometry_msgs::msg::PoseStamped target_pose;
+  target_pose.header.frame_id = map_frame_;
+  target_pose.header.stamp = rcl_node_->now();
+  target_pose.pose.position.x = tf_map_target.transform.translation.x;
+  target_pose.pose.position.y = tf_map_target.transform.translation.y;
+  target_pose.pose.position.z = tf_map_target.transform.translation.z;
+  target_pose.pose.orientation = tf_map_target.transform.rotation;
+
+  if (!get_path_client_)
+  {
+    RCLCPP_ERROR(rcl_node_->get_logger(), "GetPath action client not initialized");
+    return;
+  }
+
+  if (!get_path_client_->action_server_is_ready())
+  {
+    RCLCPP_WARN(
+      rcl_node_->get_logger(),
+      "GetPath action server '%s' is not ready",
+      get_path_action_name_.c_str());
+    return;
+  }
+
+  GetPath::Goal goal;
+  goal.use_start_pose = false;
+  goal.target_pose = target_pose;
+  goal.tolerance = 0.0;
+  goal.planner = "";
+  goal.concurrency_slot = 0;
+
+  auto options = rclcpp_action::Client<GetPath>::SendGoalOptions();
+  options.goal_response_callback = [logger = rcl_node_->get_logger(), frame_name](auto handle) {
+    if (!handle)
+    {
+      RCLCPP_ERROR(logger, "GetPath goal rejected for frame '%s'", frame_name.c_str());
+    }
+    else
+    {
+      RCLCPP_INFO(logger, "GetPath goal accepted for frame '%s'", frame_name.c_str());
+    }
+  };
+  options.result_callback = [logger = rcl_node_->get_logger(), frame_name](const auto &result) {
+    if (!result.result)
+    {
+      RCLCPP_ERROR(logger, "GetPath result missing for frame '%s'", frame_name.c_str());
+      return;
+    }
+    RCLCPP_INFO(
+      logger,
+      "GetPath completed for frame '%s' (outcome=%d): %s",
+      frame_name.c_str(),
+      result.result->outcome,
+      result.result->message.c_str());
+  };
+
+  get_path_client_->async_send_goal(goal, options);
 }
 
 void AlertPanel::updateButtonUI(bool enabled)
