@@ -540,12 +540,20 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
 
   std::vector<std::vector<std::string>> adjacency(node_snapshot.size());
 
+  auto add_edge = [&](size_t from_idx, const std::string &neighbor_id) {
+    if (from_idx >= adjacency.size()) return;
+    auto &vec = adjacency[from_idx];
+    if (std::find(vec.begin(), vec.end(), neighbor_id) == vec.end()) {
+      vec.push_back(neighbor_id);
+    }
+  };
+
   auto neighbor_worker = [&](size_t start, size_t end) {
     for (size_t idx = start; idx < end; ++idx) {
       const auto &id = node_snapshot[idx].first;
       const GraphNode &node = node_snapshot[idx].second;
-      auto &vec = adjacency[idx];
       double node_size = node.size;
+      // Standard 26-neighborhood sampling (original behavior)
       for (const auto &dir : dirs) {
         octomap::point3d sample = node.center + dir * (node_size * 0.5 + eps);
         if (sample.x() < min_bound_[0] - node_size || sample.x() > max_bound_[0] + node_size ||
@@ -600,7 +608,74 @@ void AstarOctoPlanner::buildConnectivityGraph(double eps)
           ++rejected_los;
           continue;
         }
-        if (std::find(vec.begin(), vec.end(), best_id) == vec.end()) vec.push_back(best_id);
+        add_edge(idx, best_id);
+      }
+
+      // Optional stair augmentation: search for reachable landings above this node
+      if (enable_stair_edges_) {
+        const double vertical_window = max_step_height_ + stair_vertical_margin_;
+        const double xy_radius = std::max(stair_xy_radius_, active_voxel_size_);
+        octomap::point3d min_bb(node.center.x() - xy_radius,
+          node.center.y() - xy_radius,
+          node.center.z() + 1e-3);
+        octomap::point3d max_bb(node.center.x() + xy_radius,
+          node.center.y() + xy_radius,
+          node.center.z() + vertical_window);
+        for (auto it = octree_->begin_leafs_bbx(min_bb, max_bb);
+          it != octree_->end_leafs_bbx(); ++it)
+        {
+          if (!octree_->isNodeOccupied(*it)) continue;
+          octomap::point3d occ = it.getCoordinate();
+          double landing_z = occ.z() + 0.5 * octree_->getNodeSize(it.getDepth());
+          landing_z += std::max(active_voxel_size_, 0.01);
+          double dz = landing_z - node.center.z();
+          if (dz <= 1e-3 || dz > vertical_window) continue;
+          double dx = std::fabs(occ.x() - node.center.x());
+          double dy = std::fabs(occ.y() - node.center.y());
+          if (dx > xy_radius || dy > xy_radius) continue;
+
+          octomap::point3d landing_center(occ.x(), occ.y(), landing_z);
+          double dist = landing_center.distance(node.center);
+          if (dist <= 1e-6 || dist > vertical_window + xy_radius) continue;
+          octomap::point3d dir_line = landing_center - node.center;
+          bool blocked = false;
+          double step_size = std::max(active_voxel_size_, 0.05);
+          int steps = std::max(1, static_cast<int>(std::ceil(dist / step_size)));
+          for (int si = 1; si < steps; ++si)
+          {
+            double t = static_cast<double>(si) / static_cast<double>(steps);
+            octomap::point3d s = node.center + dir_line * t;
+            octomap::OcTreeNode* nn = octree_->search(s.x(), s.y(), s.z());
+            if (nn && octree_->isNodeOccupied(nn))
+            {
+              blocked = true;
+              break;
+            }
+          }
+          if (blocked) continue;
+
+            octomap::OcTreeKey landing_key = octree_->coordToKey(landing_center);
+            auto landing_node_it = std::find_if(node_snapshot.begin(), node_snapshot.end(),
+              [&](const auto &pair) {
+                if (pair.second.key == landing_key)
+                {
+                  return true;
+                }
+                const auto &cand_center = pair.second.center;
+                double dx_c = std::fabs(cand_center.x() - landing_center.x());
+                double dy_c = std::fabs(cand_center.y() - landing_center.y());
+                double dz_c = std::fabs(cand_center.z() - landing_center.z());
+                return dx_c <= active_voxel_size_ && dy_c <= active_voxel_size_ && dz_c <= active_voxel_size_;
+              });
+            if (landing_node_it == node_snapshot.end())
+            {
+              continue;
+            }
+
+            auto landing_idx = static_cast<size_t>(landing_node_it - node_snapshot.begin());
+            add_edge(idx, landing_node_it->first);
+            add_edge(landing_idx, id);
+        }
       }
     }
   };
@@ -1073,6 +1148,9 @@ bool AstarOctoPlanner::initialize(const std::string& plugin_name, const rclcpp::
   footprint_samples_y_ = node_->declare_parameter(name_ + ".footprint_samples_y", footprint_samples_y_);
   max_surface_distance_ = node_->declare_parameter(name_ + ".max_surface_distance", max_surface_distance_);
   max_step_height_ = node_->declare_parameter(name_ + ".max_step_height", max_step_height_);
+  enable_stair_edges_ = node_->declare_parameter(name_ + ".enable_stair_edges", enable_stair_edges_);
+  stair_xy_radius_ = node_->declare_parameter(name_ + ".stair_xy_radius", stair_xy_radius_);
+  stair_vertical_margin_ = node_->declare_parameter(name_ + ".stair_vertical_margin", stair_vertical_margin_);
   // corner/edge penalty parameters
   corner_radius_ = node_->declare_parameter(name_ + ".corner_radius", 0.40);
   corner_penalty_weight_ = node_->declare_parameter(name_ + ".corner_penalty_weight", corner_penalty_weight_);
@@ -1284,6 +1362,15 @@ rcl_interfaces::msg::SetParametersResult AstarOctoPlanner::reconfigureCallback(s
     } else if (parameter.get_name() == name_ + ".max_step_height") {
       max_step_height_ = parameter.as_double();
       RCLCPP_INFO_STREAM(node_->get_logger(), "Updated max_step_height to " << max_step_height_);
+    } else if (parameter.get_name() == name_ + ".enable_stair_edges") {
+      enable_stair_edges_ = parameter.as_bool();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated enable_stair_edges to " << enable_stair_edges_);
+    } else if (parameter.get_name() == name_ + ".stair_xy_radius") {
+      stair_xy_radius_ = parameter.as_double();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated stair_xy_radius to " << stair_xy_radius_);
+    } else if (parameter.get_name() == name_ + ".stair_vertical_margin") {
+      stair_vertical_margin_ = parameter.as_double();
+      RCLCPP_INFO_STREAM(node_->get_logger(), "Updated stair_vertical_margin to " << stair_vertical_margin_);
     } else if (parameter.get_name() == name_ + ".min_vertical_clearance") {
       min_vertical_clearance_ = parameter.as_double();
       RCLCPP_INFO_STREAM(node_->get_logger(), "Updated min_vertical_clearance to " << min_vertical_clearance_);

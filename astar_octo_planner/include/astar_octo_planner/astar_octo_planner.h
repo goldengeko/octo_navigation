@@ -241,7 +241,11 @@ private:
   // Max vertical distance from a surface (occupied cell) a free node may be to be included
   double max_surface_distance_ = 0.25;
   // Maximum step/climb height (meters) allowed between node and surface for acceptance
-  double max_step_height_ = 0.20;
+  double max_step_height_ = 0.30;
+  // Stair-edge augmentation controls (search for reachable landings above current node)
+  bool enable_stair_edges_ = true;
+  double stair_xy_radius_ = 0.15;
+  double stair_vertical_margin_ = 0.05;
 
   // Minimum bound for the occupancy grid.
   std::array<double, 3> min_bound_;
