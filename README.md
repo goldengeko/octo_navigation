@@ -32,7 +32,15 @@ Start in different terminals:
 
 `ros2 launch octomap_server octomap_webots_launch.py`
 
-`rviz`
+`rviz2`
+
+`ros2 run bring_up_alert_nav offset_tf_pub   --ros-args   --params-file /home/<username>/octo_nav_ws/src/octo_navigation/bring_up_alert_nav/params/offset_frames.yaml`
+
+Add alert_rviz_plugin in Rviz2:
+
+Click Panels -> Add new Panel -> AlertPanel
+
+Use Octomap updates Button to turn on/off octomap subscription.
 
 ### Send a Goal
 Type `ros2 action send_goal /move_base_flex/move_base mbf_msgs/action/MoveBase "t<tab>`
