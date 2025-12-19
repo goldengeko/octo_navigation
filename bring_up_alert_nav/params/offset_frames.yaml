@@ -1,0 +1,27 @@
+# Parameters for bring_up_alert_nav::OffsetTfPublisher
+offset_tf_publisher:
+  ros__parameters:
+    map_frame: map
+    target_frames:
+      - Linear_Inspect_KRail
+      - Omni_Estop_KRail
+      - Omni_Inspect_KRail
+      - KRail_Start
+      - KRail_End
+    offset_frames:
+      - Linear_Inspect_KRail_offset
+      - Omni_Estop_KRail_offset
+      - Omni_Inspect_KRail_offset
+      - KRail_Start_offset
+      - KRail_End_offset
+    octomap_topic: /navigation/octomap_full
+    marker_topic: /navigation/offset_tf_markers
+    offset_distance: 0.5
+    ray_max_range: 5.0
+    ray_start_offset: 0.0
+    clearance_height: 0.1
+    publish_rate_hz: 5.0
+    ignore_unknown_cells: true
+    publish_markers: true
+    marker_scale: 0.12
+    raycast_once: true

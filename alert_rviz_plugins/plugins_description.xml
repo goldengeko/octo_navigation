@@ -1,0 +1,7 @@
+<library path="alert_rviz_plugins">
+  <class name="alert_nav_plugins/AlertPanel" type="alert_nav_plugins::AlertPanel" base_class_type="rviz_common::Panel">
+    <description>
+      Panel to toggle octomap updates and adjust penalty spreading parameters
+    </description>
+  </class>
+</library>

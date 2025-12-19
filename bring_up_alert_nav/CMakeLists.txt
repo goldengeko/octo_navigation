@@ -14,9 +14,13 @@ find_package(pluginlib REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(nav_msgs REQUIRED)  # ExePath goal.path
 find_package(geometry_msgs REQUIRED)
+find_package(octomap_msgs REQUIRED)
+find_package(octomap REQUIRED)
 find_package(rosidl_default_generators REQUIRED) # For StartNav.srv
 #find_package(webots_spot_msgs REQUIRED) # For posture
 
@@ -31,6 +35,16 @@ ament_target_dependencies(exe_path_node
   mbf_octo_core
   mbf_utility
   geometry_msgs)
+
+add_executable(offset_tf_pub src/offset_tf_pub.cpp)
+ament_target_dependencies(offset_tf_pub
+  rclcpp
+  geometry_msgs
+  tf2_ros
+  tf2_geometry_msgs
+  octomap_msgs
+  visualization_msgs)
+target_link_libraries(offset_tf_pub octomap)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/StartNav.srv"
@@ -50,6 +64,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 install(
   TARGETS
     exe_path_node
+    offset_tf_pub
     #posture_manager
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -75,9 +90,15 @@ ament_export_dependencies(
   mbf_octo_core
   mbf_msgs
   mbf_utility
-  rclcpp pluginlib
-  clcpp_action
-  geometry_msgs)
+  rclcpp
+  rclcpp_action
+  pluginlib
+  geometry_msgs
+  tf2_ros
+  tf2_geometry_msgs
+  octomap_msgs
+  octomap
+  visualization_msgs)
 
 rosidl_get_typesupport_target(TYPESUPPORT_CPP_TARGET ${PROJECT_NAME} "rosidl_typesupport_cpp")
 target_link_libraries(exe_path_node ${TYPESUPPORT_CPP_TARGET})
