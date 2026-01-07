@@ -322,7 +322,7 @@ private:
   bool enable_octomap_updates_ = true;
 
   // Octomap topic name (configurable)
-  std::string octomap_topic_ = std::string("/navigation/octomap_full");
+  std::string octomap_topic_ = std::string("/octomap_full");
 
   // Build a sampling-based connectivity graph over interior empty nodes.
   // eps: small epsilon distance (meters) to sample just outside node boundaries.

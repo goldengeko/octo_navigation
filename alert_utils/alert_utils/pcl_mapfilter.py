@@ -16,14 +16,14 @@ class PointCloudCleaner(Node):
 
         self.sub = self.create_subscription(
             PointCloud2,
-            '/navigation/octomap_point_cloud_centers',
+            '/octomap_point_cloud_centers',
             self.cloud_callback,
             10
         )
 
         self.pub = self.create_publisher(
             PointCloud2,
-            '/navigation/centerpoints_filtered',
+            '/centerpoints_filtered',
             10
         )
 

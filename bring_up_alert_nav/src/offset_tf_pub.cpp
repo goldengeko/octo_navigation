@@ -50,8 +50,8 @@ public:
     {
       frame_tasks_.push_back(FrameTask{target_frames_param[idx], offset_frames_param[idx]});
     }
-    octomap_topic_ = declare_parameter<std::string>("octomap_topic", "/navigation/octomap_full");
-    marker_topic_ = declare_parameter<std::string>("marker_topic", "/navigation/offset_tf_markers");
+    octomap_topic_ = declare_parameter<std::string>("octomap_topic", "/octomap_full");
+    marker_topic_ = declare_parameter<std::string>("marker_topic", "/offset_tf_markers");
     offset_distance_ = declare_parameter<double>("offset_distance", 0.5);
     ray_max_range_ = declare_parameter<double>("ray_max_range", 5.0);
     ray_start_offset_ = declare_parameter<double>("ray_start_offset", 0.0);
